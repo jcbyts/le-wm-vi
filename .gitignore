@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Hydra / training run outputs
+outputs/
+multirun/
+
+# Weights & Biases
+wandb/
+wandb_resume.json
+
+# Datasets / checkpoints (kept outside the repo under $STABLEWM_HOME)
+*.h5
+*.h5.zst
+*.mp4

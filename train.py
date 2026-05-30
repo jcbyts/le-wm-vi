@@ -1,4 +1,7 @@
 import os
+
+os.environ.setdefault("MUJOCO_GL", "egl")  # headless rendering for in-loop eval
+
 from functools import partial
 from pathlib import Path
 
@@ -10,7 +13,9 @@ import torch
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
 
+import planning
 from module import SIGReg
+from monitor import BehaviorEvalCallback
 from utils import get_column_normalizer, get_img_preprocessor, SaveCkptCallback
 
 
@@ -121,9 +126,61 @@ def run(cfg):
         run_name=cfg.output_model_name, cfg=cfg.model, epoch_interval=1,
     )
 
+    #############################
+    ##     behavior monitor    ##
+    #############################
+
+    monitor_callbacks = []
+    if cfg.get("monitor") and cfg.monitor.enabled:
+        monitor_keys = list(cfg.monitor.keys_to_cache)
+
+        # Raw (untransformed) dataset for planning state/goal extraction.
+        planning_dataset = swm.data.load_dataset(
+            dataset_name, transform=None, cache_dir=cache_dir,
+            keys_to_cache=monitor_keys,
+        )
+        planning_kwargs = dict(
+            env_name=cfg.monitor.env_name,
+            num_eval=cfg.monitor.num_eval,
+            eval_budget=cfg.monitor.eval_budget,
+            goal_offset_steps=cfg.monitor.goal_offset_steps,
+            plan_config=OmegaConf.to_container(cfg.monitor.plan_config, resolve=True),
+            cem_kwargs=OmegaConf.to_container(cfg.monitor.cem, resolve=True),
+            callables=OmegaConf.to_container(cfg.monitor.callables, resolve=True),
+            process=planning.build_process(planning_dataset, monitor_keys),
+            transform={
+                "pixels": planning.planning_img_transform(cfg.img_size),
+                "goal": planning.planning_img_transform(cfg.img_size),
+            },
+        )
+
+        # Long-horizon loader for the open-loop latent-rollout metric.
+        latent_cfg = dict(dataset_cfg)
+        latent_cfg["num_steps"] = cfg.history_size + cfg.monitor.roll_horizon
+        latent_ds = swm.data.load_dataset(
+            dataset_name, transform=transform, cache_dir=cache_dir, **latent_cfg
+        )
+        n_latent = min(
+            len(latent_ds), cfg.monitor.num_latent_batches * cfg.loader.batch_size
+        )
+        latent_loader = torch.utils.data.DataLoader(
+            torch.utils.data.Subset(latent_ds, list(range(n_latent))),
+            batch_size=cfg.loader.batch_size, shuffle=False, num_workers=2,
+        )
+
+        monitor_callbacks.append(BehaviorEvalCallback(
+            every_n_epochs=cfg.monitor.every_n_epochs,
+            history_size=cfg.history_size,
+            latent_loader=latent_loader,
+            num_latent_batches=cfg.monitor.num_latent_batches,
+            planning_dataset=planning_dataset,
+            planning_kwargs=planning_kwargs,
+            num_videos=cfg.monitor.num_videos,
+        ))
+
     trainer = pl.Trainer(
         **cfg.trainer,
-        callbacks=[object_dump_callback],
+        callbacks=[object_dump_callback] + monitor_callbacks,
         num_sanity_val_steps=1,
         logger=logger,
         enable_checkpointing=True,

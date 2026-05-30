@@ -41,3 +41,40 @@ loss:
     kwargs:
       knots: 17
       num_proj: 1024
+
+# Behavioral monitoring logged to wandb every `every_n_epochs` (rank 0 only).
+# Defaults target PushT; for other datasets adjust env_name / callables / keys_to_cache.
+monitor:
+  enabled: True
+  every_n_epochs: 10
+  num_videos: 4
+  # -- open-loop latent-rollout error (no env, cheap): multi-step prediction quality
+  roll_horizon: 10
+  num_latent_batches: 4
+  # -- planning success + rollout videos (env + MPC, heavier)
+  env_name: swm/PushT-v1
+  num_eval: 8
+  eval_budget: 50
+  goal_offset_steps: 25
+  keys_to_cache: [action, proprio, state]
+  plan_config:
+    horizon: 5
+    receding_horizon: 5
+    action_block: 5
+  cem:
+    batch_size: 1
+    num_samples: 300
+    var_scale: 1.0
+    n_steps: 30
+    topk: 30
+    device: cuda
+    seed: 42
+  callables:
+    - method: _set_state
+      args:
+        state:
+          value: state
+    - method: _set_goal_state
+      args:
+        goal_state:
+          value: goal_state
