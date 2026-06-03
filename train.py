@@ -14,6 +14,7 @@ from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
 
 import planning
+from model import vijepa_forward
 from module import SIGReg
 from monitor import BehaviorEvalCallback
 from utils import get_column_normalizer, get_img_preprocessor, SaveCkptCallback
@@ -61,7 +62,11 @@ def run(cfg):
     dataset = swm.data.load_dataset(
         dataset_name, transform=None, cache_dir=cache_dir, **dataset_cfg
     )
-    transforms = [get_img_preprocessor(source='pixels', target='pixels', img_size=cfg.img_size)]
+    # variants 3-6 (vijepa) infer/reconstruct through a decoder in [0,1] pixel
+    # space at low res; variants 1-2 (lejepa) use the ImageNet-normalized ViT path.
+    normalize_img = cfg.get("forward_type", "lejepa") != "vijepa"
+    transforms = [get_img_preprocessor(source='pixels', target='pixels',
+                                       img_size=cfg.img_size, normalize=normalize_img)]
     
     with open_dict(cfg):
         for col in cfg.data.dataset.keys_to_load:
@@ -99,12 +104,21 @@ def run(cfg):
     }
 
     data_module = spt.data.DataModule(train=train, val=val)
-    world_model = spt.Module(
-        model = world_model,
-        sigreg = SIGReg(**cfg.loss.sigreg.kwargs),
-        forward=partial(lejepa_forward, cfg=cfg),
-        optim=optimizers,
-    )
+    if cfg.get("forward_type", "lejepa") == "vijepa":
+        # variants 3-6: variational FOND-JEPA, reconstruction anchor, no SIGReg
+        world_model = spt.Module(
+            model=world_model,
+            forward=partial(vijepa_forward, cfg=cfg),
+            optim=optimizers,
+        )
+    else:
+        # variants 1-2: LeWM MSE-JEPA + SIGReg (variant 1 = sigreg.weight 0)
+        world_model = spt.Module(
+            model=world_model,
+            sigreg=SIGReg(**cfg.loss.sigreg.kwargs),
+            forward=partial(lejepa_forward, cfg=cfg),
+            optim=optimizers,
+        )
 
     ##########################
     ##       training       ##

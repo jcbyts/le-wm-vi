@@ -1,0 +1,64 @@
+# Variational FOND-JEPA training (variants 3-6). Select family via
+#   model=fond_poisson | model=fond_gaussian
+# and loss form via
+#   loss.pred_loss=exact_kl | loss.pred_loss=quadratic_fisher
+#
+# Variant map:
+#   3 Gaussian VI-JEPA   : model=fond_gaussian loss.pred_loss=exact_kl
+#   4 Gaussian Fisher    : model=fond_gaussian loss.pred_loss=quadratic_fisher
+#   5 Poisson VI-JEPA    : model=fond_poisson  loss.pred_loss=exact_kl
+#   6 Poisson Fisher     : model=fond_poisson  loss.pred_loss=quadratic_fisher
+defaults:
+  - _self_
+  - launcher: local
+  - data: pusht
+  - model: fond_poisson
+
+output_model_name: fond
+subdir: ${hydra:job.id}
+
+forward_type: vijepa            # selects vijepa_forward in train.py
+
+num_workers: 6
+train_split: 0.9
+seed: 3072
+# Variants 3-6 reconstruct/infer through a low-capacity decoder at low res.
+# Pixels are fed in [0,1] at this resolution (NOT the ViT's 224 ImageNet path).
+img_size: 64
+embed_dim: 192
+history_size: 3
+
+trainer:
+  max_epochs: 100
+  devices: auto
+  accelerator: gpu
+  precision: 32                 # fp32: exact-KL cancellation (spec corrections C3)
+  gradient_clip_val: 1.0
+
+loader:
+  batch_size: 128
+  num_workers: ${num_workers}
+  persistent_workers: True
+  prefetch_factor: 3
+  pin_memory: True
+
+optimizer:
+  type: AdamW
+  lr: 5e-5
+  weight_decay: 1e-3
+
+num_preds: 1
+
+loss:
+  pred_loss: exact_kl           # exact_kl | quadratic_fisher
+  kl_weight: 1.0                # beta on the predictive term
+  recon_weight: 1.0             # weight on the reconstruction anchor
+  # --- scheme selection (see IMPLEMENTED_OBJECTIVE.md) ---
+  target_scheme: online_filtering   # online_filtering (scheme A, MAIN) | static_vi_target (scheme B, ablation)
+  infer_objective: free_energy      # free_energy (R + beta_infer*KL-to-prior) | recon_only
+  beta_infer: 1.0                   # weight of the KL-to-prior term inside inference
+
+# Planning/eval terminal cost for these families needs the KL adaptation
+# (spec §5.5) before in-loop planning is meaningful; disabled until then.
+monitor:
+  enabled: False

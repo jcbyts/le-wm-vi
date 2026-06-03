@@ -1,0 +1,38 @@
+# Poisson FOND-JEPA (variants 5 & 6). Natural parameter P = D (log-rate).
+# Predictor / action_encoder architecture identical to LeWM; only the head
+# (family) and the encoder (inference-through-decoder) differ.
+_target_: model.FONDJEPA
+
+latent_dim: ${embed_dim}
+head: poisson
+infer_init: static_prior   # only used by the static encode() path (scheme B); scheme A inits at the predictive prior
+k_inner: 4
+tau: 0.2
+infer_lr: 1.0
+img_ch: 3
+img_hw: ${img_size}
+
+decoder:
+  _target_: model.ConvDecoder
+  latent_dim: ${embed_dim}
+  img_ch: 3
+  img_hw: ${img_size}
+  grid: 8
+
+predictor:
+  _target_: module.ARPredictor
+  num_frames: ${history_size}
+  input_dim: ${embed_dim}
+  hidden_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  depth: 6
+  heads: 16
+  mlp_dim: 2048
+  dim_head: 64
+  dropout: 0.1
+  emb_dropout: 0.0
+
+action_encoder:
+  _target_: module.Embedder
+  input_dim: ???
+  emb_dim: ${embed_dim}

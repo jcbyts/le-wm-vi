@@ -3,9 +3,12 @@ import torch
 from stable_pretraining import data as dt
 from lightning.pytorch.callbacks import Callback
 
-def get_img_preprocessor(source: str, target: str, img_size: int = 224):
-    imagenet_stats = dt.dataset_stats.ImageNet
-    to_image = dt.transforms.ToImage(**imagenet_stats, source=source, target=target)
+def get_img_preprocessor(source: str, target: str, img_size: int = 224, normalize: bool = True):
+    """normalize=True: ImageNet mean/std (the ViT/LeWM path, variants 1-2).
+    normalize=False: plain [0,1] scaling (the FOND inference/recon path, variants
+    3-6 — the decoder targets PushT pixels in [0,1]; see spec corrections C2)."""
+    stats = dt.dataset_stats.ImageNet if normalize else {}
+    to_image = dt.transforms.ToImage(scale=True, **stats, source=source, target=target)
     resize = dt.transforms.Resize(img_size, source=source, target=target)
     return dt.transforms.Compose(to_image, resize)
 

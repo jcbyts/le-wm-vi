@@ -1,0 +1,5 @@
+variant,K,recon_w,nonfinite,rank_frac,var_med,temp_var,collapse_pass,corr_norm,recon_gain,D_pred,D_noop,noop_ratio,kl_exact,fisher_q,exact/quad,sat_frac,rate_or_lv_max,error
+poisson_exact_kl,4,0.001,0,0.197,8.92e-02,1.12e-01,1,6.9154,7.47278,312.569,201.985,1.547,312.569,511.491,0.611,0.001,148.41,
+poisson_exact_kl,4,0.01,0,0.211,6.11e-01,6.05e-01,1,15.482,91.66138,2877.896,2887.715,0.997,2877.896,905.588,3.178,0.016,148.41,
+gaussian_exact_kl,4,0.001,0,0.105,5.88e-04,6.83e-04,1,1.8448,0.77148,17.877,0.229,78.03,17.877,10.027,1.783,0.0,0.24,
+gaussian_exact_kl,4,0.01,0,0.1,7.25e-04,9.17e-04,0,2.0873,0.97583,18.061,0.305,59.204,18.061,10.209,1.769,0.0,0.33,
