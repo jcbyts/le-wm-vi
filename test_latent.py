@@ -176,6 +176,28 @@ def test_gaussian_unit_variance_lewm_identity():
     print("[unit_variance] Gaussian Fisher quad == 0.5||mu-muhat||^2 == LeWM MSE constant  OK")
 
 
+def test_fisher_metric_values():
+    det = make_head("deterministic")
+    z = torch.randn(4, _D)
+    assert torch.allclose(det.fisher_metric(z), torch.ones_like(z))
+
+    pois = make_head("poisson")
+    log_rate = torch.linspace(-2.0, 2.0, steps=_D).view(1, _D)
+    assert torch.allclose(pois.fisher_metric(log_rate), log_rate.exp())
+
+    gauss = make_head("gaussian")
+    mu = torch.randn(3, _D)
+    lv = torch.linspace(-1.0, 1.0, steps=_D).view(1, _D).expand_as(mu)
+    param = torch.cat([mu, lv], dim=-1)
+    expected = torch.cat([torch.exp(-lv), torch.full_like(lv, 0.5)], dim=-1)
+    assert torch.allclose(gauss.fisher_metric(param), expected)
+
+    unit = make_head("gaussian", fixed_unit_variance=True)
+    assert torch.allclose(unit.fisher_metric(param), torch.ones_like(param))
+    print("[fisher_metric] analytical diagonal Fisher values OK")
+
+
+
 def test_sample_shapes():
     """sample() maps param (...,P) -> code (...,D); to_code likewise."""
     for fam, P, D in [("deterministic", _D, _D), ("poisson", _D, _D), ("gaussian", 2 * _D, _D)]:
@@ -189,6 +211,7 @@ def test_sample_shapes():
 
 
 if __name__ == "__main__":
+    test_fisher_metric_values()
     test_sample_shapes()
     test_predictive_metric_detach_gradient()
     test_gaussian_unit_variance_lewm_identity()

@@ -194,6 +194,10 @@ class LatentHead:
     def fisher_quad(self, post, prior):
         raise NotImplementedError
 
+    def fisher_metric(self, param):
+        """Analytical diagonal Fisher information I(eta)."""
+        raise NotImplementedError
+
 
 class DeterministicHead(LatentHead):
     family = "deterministic"
@@ -215,6 +219,9 @@ class DeterministicHead(LatentHead):
 
     def fisher_quad(self, post, prior):
         return (post - prior).pow(2).sum(-1).mean()
+
+    def fisher_metric(self, param):
+        return torch.ones_like(param)
 
 
 class GaussianHead(LatentHead):
@@ -302,6 +309,13 @@ class GaussianHead(LatentHead):
             self.full_fisher, fixed_unit_variance=self.fixed_unit_variance,
         ).sum(-1).mean()
 
+    def fisher_metric(self, param):
+        mu, lv = _split_gaussian(param)
+        if self.fixed_unit_variance:
+            return torch.ones_like(param)
+        precision = torch.exp(-lv.clamp(LV_LO, LV_HI))
+        return torch.cat([precision, torch.full_like(lv, 0.5)], dim=-1)
+
 
 class PoissonHead(LatentHead):
     family = "poisson"
@@ -348,6 +362,9 @@ class PoissonHead(LatentHead):
 
     def fisher_quad(self, post, prior):
         return poisson_fisher_quad(post, prior).sum(-1).mean()
+
+    def fisher_metric(self, param):
+        return torch.exp(param.clamp(LOG_LO, LOG_HI))
 
 
 _HEADS = {

@@ -136,6 +136,19 @@ def test_beta_behavior():
         assert cs[3.0] < cs[0.1], f"{family}: higher beta did not shrink correction"
 
 
+def test_inner_step_preconditions_poisson_gradient():
+    m = build("poisson", k_inner=1, D=64, img_hw=32, infer_lr=1.0)
+    param = torch.full((1, 64), 2.0)
+    grad = torch.exp(param) * torch.full_like(param, 3.0)
+    fisher = m.head.fisher_metric(param)
+    out, _ = m._inner_step(param, grad, None, preconditioner=fisher, detach_grad=True)
+    expected = m.head.clamp_param(param - grad / (fisher + 1e-6))
+    assert torch.allclose(out, expected)
+    assert torch.allclose(out, torch.full_like(param, -1.0), atol=1e-5)
+    print("[preconditioner] Poisson Euclidean gradient divided by Fisher metric  OK")
+
+
+
 def test_saturation_diagnostic():
     """param_stats must flag a log-rate pinned at exp(5) (LOG_HI). Hard diagnostic."""
     head = make_head("poisson")
@@ -150,6 +163,7 @@ def test_saturation_diagnostic():
 
 
 if __name__ == "__main__":
+    test_inner_step_preconditions_poisson_gradient()
     test_predictive_init()
     test_action_dependence()
     test_zero_step()

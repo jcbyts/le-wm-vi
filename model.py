@@ -141,9 +141,15 @@ class FONDJEPA(nn.Module):
             return value.get("default", default) if found is None else found
         return value
 
-    def _inner_step(self, param, grad, velocity, detach_grad=True):
+    def _inner_step(self, param, grad, velocity, preconditioner=None, detach_grad=True):
         if detach_grad:
             grad = grad.detach()
+
+        if preconditioner is not None:
+            if detach_grad:
+                preconditioner = preconditioner.detach()
+            grad = grad / (preconditioner + 1e-6)
+
         if self.infer_grad_clip is not None:
             max_norm = float(self.infer_grad_clip)
             flat = grad.flatten(1)
@@ -176,7 +182,7 @@ class FONDJEPA(nn.Module):
         e = 0.5 * (x_img - y).pow(2)
         return e.sum() if reduce_sum else e.flatten(1).sum(1)
 
-    def _infer_loop(self, param, x_img, energy_fn):
+    def _infer_loop(self, param, x_img, energy_fn, fisher_fn=None):
         """Run inner inference, optionally differentiating the final k_bptt steps."""
         velocity = torch.zeros_like(param) if self.infer_momentum > 0.0 else None
         if not self.infer_backprop:
@@ -184,7 +190,10 @@ class FONDJEPA(nn.Module):
                 with torch.inference_mode(False), torch.enable_grad():
                     p = param.detach().clone().requires_grad_(True)
                     g = torch.autograd.grad(energy_fn(p), p)[0]
-                param, velocity = self._inner_step(param, g, velocity, detach_grad=True)
+                    P = fisher_fn(p) if fisher_fn is not None else None
+                param, velocity = self._inner_step(
+                    param, g, velocity, preconditioner=P, detach_grad=True
+                )
             return param
 
         k_bptt = max(0, min(int(self.k_bptt), int(self.k_inner)))
@@ -193,7 +202,10 @@ class FONDJEPA(nn.Module):
             with torch.inference_mode(False), torch.enable_grad():
                 p = param.detach().clone().requires_grad_(True)
                 g = torch.autograd.grad(energy_fn(p), p)[0]
-            param, velocity = self._inner_step(param, g, velocity, detach_grad=True)
+                P = fisher_fn(p) if fisher_fn is not None else None
+            param, velocity = self._inner_step(
+                param, g, velocity, preconditioner=P, detach_grad=True
+            )
 
         if n_detached > 0:
             param = param.detach().requires_grad_(True)
@@ -203,7 +215,10 @@ class FONDJEPA(nn.Module):
                 if not param.requires_grad:
                     param = param.detach().requires_grad_(True)
                 g = torch.autograd.grad(energy_fn(param), param, create_graph=True)[0]
-                param, velocity = self._inner_step(param, g, velocity, detach_grad=False)
+                P = fisher_fn(param) if fisher_fn is not None else None
+                param, velocity = self._inner_step(
+                    param, g, velocity, preconditioner=P, detach_grad=False
+                )
         return param
 
     def _infer_one_frame(self, x_img, init_param, return_recon=False):
@@ -216,10 +231,16 @@ class FONDJEPA(nn.Module):
         init_param = self.head.clamp_param(init_param)
         r0 = self._recon_energy(init_param, x_img, deterministic=True).detach() if return_recon else None
         param = init_param
+        def fisher_fn(p):
+            p_kl = torch.zeros_like(p)
+            decoder_damping = torch.ones_like(p)
+            return p_kl + decoder_damping
+
         param = self._infer_loop(
             param,
             x_img,
             lambda p: self._recon_energy(p, x_img, reduce_sum=True),
+            fisher_fn=fisher_fn,
         )
         if return_recon:
             rK = self._recon_energy(param, x_img, deterministic=True).detach()
@@ -285,7 +306,12 @@ class FONDJEPA(nn.Module):
                 energy = energy + beta * self.head.kl_energy(p, prior)
             return energy
 
-        param = self._infer_loop(param, x_img, energy_fn)
+        def fisher_fn(p):
+            p_kl = beta * self.head.fisher_metric(p) if use_kl else torch.zeros_like(p)
+            decoder_damping = torch.ones_like(p)
+            return p_kl + decoder_damping
+
+        param = self._infer_loop(param, x_img, energy_fn, fisher_fn=fisher_fn)
         if return_diag:
             with torch.no_grad():
                 rK = self._recon_energy(param, x_img, deterministic=True)        # (N,)
