@@ -51,14 +51,45 @@ num_preds: 1
 
 loss:
   pred_loss: exact_kl           # exact_kl | quadratic_fisher
-  kl_weight: 1.0                # beta on the predictive term
-  recon_weight: 1.0             # weight on the reconstruction anchor
+  beta: 10.0                    # scales KL in inference and outer predictive term
   # --- scheme selection (see IMPLEMENTED_OBJECTIVE.md) ---
   target_scheme: online_filtering   # online_filtering (scheme A, MAIN) | static_vi_target (scheme B, ablation)
-  infer_objective: free_energy      # free_energy (R + beta_infer*KL-to-prior) | recon_only
-  beta_infer: 1.0                   # weight of the KL-to-prior term inside inference
+  infer_objective: free_energy      # free_energy (R + beta*KL-to-prior) | recon_only
+  infer_backprop: true              # differentiable inner inference loop
+  k_bptt: 4                         # BPTT through the final K inner steps
+  log_viz: true                     # per-epoch FOND recon / hallucination / rollout panels
+  viz_num_frames: 8
 
-# Planning/eval terminal cost for these families needs the KL adaptation
-# (spec §5.5) before in-loop planning is meaningful; disabled until then.
+# Behavioral monitoring for FOND. Uses raw [0,1] 64px pixels via train.py.
 monitor:
-  enabled: False
+  enabled: True
+  every_n_epochs: 1
+  num_videos: 4
+  roll_horizon: 8
+  num_latent_batches: 2
+  env_name: swm/PushT-v1
+  num_eval: 4
+  eval_budget: 50
+  goal_offset_steps: 25
+  keys_to_cache: [action, proprio, state]
+  plan_config:
+    horizon: 5
+    receding_horizon: 5
+    action_block: 5
+  cem:
+    batch_size: 1
+    num_samples: 300
+    var_scale: 1.0
+    n_steps: 30
+    topk: 30
+    device: cuda
+    seed: 42
+  callables:
+    - method: _set_state
+      args:
+        state:
+          value: state
+    - method: _set_goal_state
+      args:
+        goal_state:
+          value: goal_state

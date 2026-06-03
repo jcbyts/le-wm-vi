@@ -5,7 +5,7 @@
   action_dependence_test : shuffling actions changes eta_hat_t (and eta_t).
   zero_step_test         : K=0 => eta_t == eta_hat_t, recon_gain=correction_norm=D_pred=0.
   free_energy_descent_test: F(eta_K) < F(eta_0) for most examples (free_energy).
-  beta_behavior_test     : high beta_infer shrinks correction_norm; low beta grows it.
+  beta_behavior_test     : high beta shrinks correction_norm; low beta grows it.
   saturation_test        : param_stats flags log-rate pinned at exp(5) (hard diagnostic).
 
 Stub predictor/action_encoder (deterministic, no dropout) so the init recompute
@@ -42,7 +42,7 @@ def build(family, k_inner, D=192, img_hw=32, infer_lr=0.3):
         decoder=ConvDecoder(D, img_ch=3, img_hw=img_hw, grid=8),
         predictor=StubPredictor(P), action_encoder=StubActionEncoder(4, P),
         latent_dim=D, head=head, k_inner=k_inner, tau=0.2, infer_lr=infer_lr,
-        infer_init="predictive_prior", img_ch=3, img_hw=img_hw,
+        infer_backprop=False, infer_init="predictive_prior", img_ch=3, img_hw=img_hw,
     )
     m.eval()
     return m
@@ -56,7 +56,7 @@ def test_predictive_init():
     for family in ["poisson", "gaussian"]:
         m = build(family, k_inner=3)
         b = _batch()
-        info = m.filter_sequence(b, history_size=3, beta_infer=1.0,
+        info = m.filter_sequence(b, history_size=3, beta=1.0,
                                  infer_objective="free_energy", return_diag=False)
         eta, ehat = info["emb"], info["pred_hat"]
         act_emb = m.action_encoder(b["action"])
@@ -106,7 +106,7 @@ def test_free_energy_descent():
         N = 128
         x = torch.rand(N, 3, 32, 32)
         prior = m.prior_param.expand(N, -1).detach()
-        _, d = m._infer_online(x, prior, beta_infer=1.0, infer_objective="free_energy", return_diag=True)
+        _, d = m._infer_online(x, prior, beta=1.0, infer_objective="free_energy", return_diag=True)
         frac = (d["FK"] < d["F0"]).float().mean().item()
         print(f"[{family}] FE descent: frac F_down={frac:.2f}  R0={d['R0'].mean():.3f} "
               f"RK={d['RK'].mean():.3f}  KL_K={d['KL_K'].mean():.3f}  "
@@ -126,7 +126,7 @@ def test_beta_behavior():
         x = torch.rand(N, 3, 32, 32)
         prior = m.prior_param.expand(N, -1).detach()
         def corr(beta, obj):
-            p, _ = m._infer_online(x, prior, beta_infer=beta, infer_objective=obj, return_diag=True)
+            p, _ = m._infer_online(x, prior, beta=beta, infer_objective=obj, return_diag=True)
             return (p - prior).norm(dim=-1).mean().item()
         c_recon = corr(0.0, "recon_only")
         cs = {b: corr(b, "free_energy") for b in [0.1, 1.0, 3.0]}

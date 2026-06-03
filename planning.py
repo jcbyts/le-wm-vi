@@ -23,20 +23,17 @@ def _episode_col(dataset):
     return "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
 
 
-def planning_img_transform(img_size):
+def planning_img_transform(img_size, normalize_img=True):
     """Image/goal transform applied to env observations during planning.
 
-    Matches ``eval.py``'s ``img_transform``: to-image, float scale, ImageNet
-    normalize, resize.
+    LeWM uses ImageNet-normalized ViT inputs. FOND reconstructs/infer through a
+    sigmoid decoder, so it must receive raw [0,1] pixels at the configured size.
     """
-    return transforms.Compose(
-        [
-            transforms.ToImage(),
-            transforms.ToDtype(torch.float32, scale=True),
-            transforms.Normalize(**spt.data.dataset_stats.ImageNet),
-            transforms.Resize(size=img_size),
-        ]
-    )
+    steps = [transforms.ToImage(), transforms.ToDtype(torch.float32, scale=True)]
+    if normalize_img:
+        steps.append(transforms.Normalize(**spt.data.dataset_stats.ImageNet))
+    steps.append(transforms.Resize(size=img_size))
+    return transforms.Compose(steps)
 
 
 def build_process(dataset, keys_to_cache):

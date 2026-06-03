@@ -16,7 +16,7 @@ from omegaconf import OmegaConf, open_dict
 import planning
 from model import vijepa_forward
 from module import SIGReg
-from monitor import BehaviorEvalCallback
+from monitor import BehaviorEvalCallback, FondVizCallback
 from utils import get_column_normalizer, get_img_preprocessor, SaveCkptCallback
 
 
@@ -145,6 +145,13 @@ def run(cfg):
     #############################
 
     monitor_callbacks = []
+    if cfg.get("forward_type", "lejepa") == "vijepa" and cfg.loss.get("log_viz", True):
+        monitor_callbacks.append(FondVizCallback(
+            history_size=cfg.history_size,
+            val_loader=val,
+            num_frames=cfg.loss.get("viz_num_frames", 8),
+        ))
+
     if cfg.get("monitor") and cfg.monitor.enabled:
         monitor_keys = list(cfg.monitor.keys_to_cache)
 
@@ -163,8 +170,8 @@ def run(cfg):
             callables=OmegaConf.to_container(cfg.monitor.callables, resolve=True),
             process=planning.build_process(planning_dataset, monitor_keys),
             transform={
-                "pixels": planning.planning_img_transform(cfg.img_size),
-                "goal": planning.planning_img_transform(cfg.img_size),
+                "pixels": planning.planning_img_transform(cfg.img_size, normalize_img=normalize_img),
+                "goal": planning.planning_img_transform(cfg.img_size, normalize_img=normalize_img),
             },
         )
 

@@ -122,6 +122,60 @@ def test_directions_and_nonnegativity():
     print("\n[both] KL(p||p)=0, KL>0, FisherQuad>0  OK")
 
 
+
+
+def test_predictive_metric_detach_gradient():
+    """FIX1: predictive Fisher losses detach only the metric, not the residual."""
+    log_post = (torch.randn(32, _D) * 0.4).detach()
+    log_prior = (torch.randn(32, _D) * 0.4).requires_grad_(True)
+    loss = poisson_fisher_quad(log_post, log_prior, detach_metric=True).sum()
+    grad = torch.autograd.grad(loss, log_prior)[0]
+    precision = torch.exp(log_prior.detach().clamp(-12.0, 5.0))
+    expected = precision * (log_prior.detach() - log_post)
+    assert torch.allclose(grad, expected, atol=1e-10, rtol=1e-10)
+
+    log_prior2 = log_prior.detach().clone().requires_grad_(True)
+    loss2 = poisson_fisher_quad(log_post, log_prior2, detach_metric=False).sum()
+    grad2 = torch.autograd.grad(loss2, log_prior2)[0]
+    assert not torch.allclose(grad2, expected, atol=1e-8, rtol=1e-8)
+
+    mu = torch.randn(32, _D)
+    mu_h = torch.randn(32, _D).requires_grad_(True)
+    lv = torch.zeros_like(mu)
+    lv_h = (torch.randn(32, _D) * 0.3).requires_grad_(True)
+    post = torch.cat([mu, lv], dim=-1).detach()
+    prior = torch.cat([mu_h, lv_h], dim=-1)
+    loss = gaussian_fisher_quad(post, prior, include_var=False, detach_metric=True).sum()
+    grad_mu, grad_lv = torch.autograd.grad(loss, [mu_h, lv_h], allow_unused=True)
+    precision = torch.exp(-lv_h.detach().clamp(-10.0, 5.0))
+    assert torch.allclose(grad_mu, precision * (mu_h.detach() - mu), atol=1e-10, rtol=1e-10)
+    assert grad_lv is None or grad_lv.abs().max().item() < 1e-12
+
+    mu_h2 = mu_h.detach().clone().requires_grad_(True)
+    lv_h2 = lv_h.detach().clone().requires_grad_(True)
+    prior2 = torch.cat([mu_h2, lv_h2], dim=-1)
+    loss2 = gaussian_fisher_quad(post, prior2, include_var=False, detach_metric=False).sum()
+    grad_lv2 = torch.autograd.grad(loss2, lv_h2)[0]
+    assert grad_lv2.abs().max().item() > 1e-8
+    print("\n[detach_metric] predictive Fisher gradient is clean residual gradient  OK")
+
+
+def test_gaussian_unit_variance_lewm_identity():
+    """FIX3: Gaussian fixed-unit floor reduces the predictive quad to LeWM MSE."""
+    head = make_head("gaussian", fixed_unit_variance=True)
+    mu = torch.randn(16, _D)
+    mu_hat = torch.randn(16, _D)
+    # Nonzero logvars should be ignored by the fixed-unit floor.
+    post = torch.cat([mu, torch.randn_like(mu)], dim=-1)
+    prior = torch.cat([mu_hat, torch.randn_like(mu_hat)], dim=-1)
+    pred = head.pred_term(post, prior, "quadratic_fisher", detach_metric=True)
+    expected = 0.5 * (mu - mu_hat).pow(2).sum(-1).mean()
+    lewm_mse = (mu - mu_hat).pow(2).mean()
+    assert torch.allclose(pred, expected, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(pred, 0.5 * _D * lewm_mse, atol=1e-5, rtol=1e-5)
+    print("[unit_variance] Gaussian Fisher quad == 0.5||mu-muhat||^2 == LeWM MSE constant  OK")
+
+
 def test_sample_shapes():
     """sample() maps param (...,P) -> code (...,D); to_code likewise."""
     for fam, P, D in [("deterministic", _D, _D), ("poisson", _D, _D), ("gaussian", 2 * _D, _D)]:
@@ -136,6 +190,8 @@ def test_sample_shapes():
 
 if __name__ == "__main__":
     test_sample_shapes()
+    test_predictive_metric_detach_gradient()
+    test_gaussian_unit_variance_lewm_identity()
     test_directions_and_nonnegativity()
     test_poisson_convergence()
     test_gaussian_convergence()

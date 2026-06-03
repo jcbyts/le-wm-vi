@@ -15,15 +15,14 @@ from torchvision.transforms import v2 as transforms
 import stable_worldmodel as swm
 
 def img_transform(cfg):
-    transform = transforms.Compose(
-        [
-            transforms.ToImage(),
-            transforms.ToDtype(torch.float32, scale=True),
-            transforms.Normalize(**spt.data.dataset_stats.ImageNet),
-            transforms.Resize(size=cfg.eval.img_size),
-        ]
-    )
-    return transform
+    steps = [
+        transforms.ToImage(),
+        transforms.ToDtype(torch.float32, scale=True),
+    ]
+    if cfg.eval.get("normalize_img", True):
+        steps.append(transforms.Normalize(**spt.data.dataset_stats.ImageNet))
+    steps.append(transforms.Resize(size=cfg.eval.img_size))
+    return transforms.Compose(steps)
 
 
 def get_episodes_length(dataset, episodes):

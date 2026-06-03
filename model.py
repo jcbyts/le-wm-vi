@@ -14,10 +14,9 @@ Relationship to LeWM (jepa.JEPA):
 The predictor operates on emb (P-dim), so the planner/eval path is shared.
 
 Gradient routing (preserved from the validated reference, spec §2.3):
-  - inference steps are FIRST-ORDER / DETACHED (g.detach()), so the posterior is
-    differentiable only w.r.t. the learned prior, NOT the decoder. Therefore the
-    predictive (KL/Fisher) term gives the DECODER zero gradient; the predictor is
-    trained by the predictive term, the decoder by reconstruction.
+  - inference steps can be differentiable (BPTT through the inner loop) or
+    first-order / detached for ablations. The predictive target remains
+    stop-grad, while reconstruction can train the decoder through inference.
   - inference steps the natural parameter eta (spec §4 Alg.1), which is what makes
     it family-agnostic (the reference's Poisson code stepped the code z instead,
     which does not generalize to Gaussian's 2D parameter).
@@ -91,14 +90,22 @@ class FONDJEPA(nn.Module):
         k_inner=4,               # inference steps per frame
         tau=0.2,                 # fixed EATcubic temperature (Poisson)
         infer_lr=1.0,            # inference step size on the natural parameter
+        infer_grad_clip=None,     # optional per-example norm clip for inner gradients
+        infer_momentum=0.0,       # optional heavy-ball momentum for inner inference
+        infer_backprop=True,      # BPTT through the inner inference loop
+        k_bptt=None,              # truncate BPTT to the final k steps when needed
         full_fisher=False,       # gaussian: full 2nd-order quad vs mu-only (see latent.variant_name)
+        fixed_unit_variance=False,  # gaussian floor: hold logvar == 0 (G = I)
         infer_init="static_prior",  # static_prior (scheme B) | predictive_prior (scheme A)
         img_ch=3,
         img_hw=64,
     ):
         super().__init__()
         if head is None or isinstance(head, str):
-            head = make_head(head or "poisson", tau=tau, full_fisher=full_fisher)
+            head = make_head(
+                head or "poisson", tau=tau, full_fisher=full_fisher,
+                fixed_unit_variance=fixed_unit_variance,
+            )
         self.head = head
         infer_init = {"prior": "static_prior", "predictive": "predictive_prior"}.get(infer_init, infer_init)
         self.infer_init = infer_init
@@ -112,10 +119,50 @@ class FONDJEPA(nn.Module):
         self.param_dim = latent_dim * head.param_mult
         self.k_inner = k_inner
         self.tau = tau
-        self.infer_lr = infer_lr
+        self.infer_lr = self._family_value(infer_lr)
+        self.infer_grad_clip = self._family_value(infer_grad_clip, default=None)
+        self.infer_momentum = float(self._family_value(infer_momentum))
+        assert self.infer_momentum >= 0.0, "infer_momentum must be nonnegative"
+        self.infer_backprop = bool(infer_backprop)
+        self.k_bptt = k_inner if k_bptt is None else int(k_bptt)
         self.img_ch, self.img_hw = img_ch, img_hw
+        self.beta = 1.0
         # learnable prior natural-parameter (inference initialization / belief prior)
         self.prior_param = nn.Parameter(torch.zeros(1, self.param_dim))
+
+    def _family_value(self, value, default=0.0):
+        """Allow Hydra configs to pass either a scalar or {family: value}."""
+        if value is None:
+            return default
+        if isinstance(value, dict):
+            return value.get(self.head.family, value.get("default", default))
+        if hasattr(value, "get") and not isinstance(value, (str, bytes)):
+            found = value.get(self.head.family, None)
+            return value.get("default", default) if found is None else found
+        return value
+
+    def _inner_step(self, param, grad, velocity, detach_grad=True):
+        if detach_grad:
+            grad = grad.detach()
+        if self.infer_grad_clip is not None:
+            max_norm = float(self.infer_grad_clip)
+            flat = grad.flatten(1)
+            norm = flat.norm(dim=1, keepdim=True).clamp_min(1e-12)
+            scale = (max_norm / norm).clamp(max=1.0).view(-1, *([1] * (grad.ndim - 1)))
+            grad = grad * scale
+        step = -float(self.infer_lr) * grad
+        if self.infer_momentum > 0.0:
+            velocity = self.infer_momentum * velocity + step
+            step = velocity
+        param = self.head.clamp_param(param + step)
+        return param, velocity
+
+    def _set_runtime_inference(self, *, infer_backprop=None, k_bptt=None):
+        """Update runtime loss-controlled inference knobs from the train config."""
+        if infer_backprop is not None:
+            self.infer_backprop = bool(infer_backprop)
+        if k_bptt is not None:
+            self.k_bptt = int(k_bptt)
 
     # ---- inference: replaces the amortized encoder -------------------------
 
@@ -129,23 +176,51 @@ class FONDJEPA(nn.Module):
         e = 0.5 * (x_img - y).pow(2)
         return e.sum() if reduce_sum else e.flatten(1).sum(1)
 
+    def _infer_loop(self, param, x_img, energy_fn):
+        """Run inner inference, optionally differentiating the final k_bptt steps."""
+        velocity = torch.zeros_like(param) if self.infer_momentum > 0.0 else None
+        if not self.infer_backprop:
+            for _ in range(self.k_inner):
+                with torch.inference_mode(False), torch.enable_grad():
+                    p = param.detach().clone().requires_grad_(True)
+                    g = torch.autograd.grad(energy_fn(p), p)[0]
+                param, velocity = self._inner_step(param, g, velocity, detach_grad=True)
+            return param
+
+        k_bptt = max(0, min(int(self.k_bptt), int(self.k_inner)))
+        n_detached = self.k_inner - k_bptt
+        for _ in range(n_detached):
+            with torch.inference_mode(False), torch.enable_grad():
+                p = param.detach().clone().requires_grad_(True)
+                g = torch.autograd.grad(energy_fn(p), p)[0]
+            param, velocity = self._inner_step(param, g, velocity, detach_grad=True)
+
+        if n_detached > 0:
+            param = param.detach().requires_grad_(True)
+            velocity = velocity.detach() if velocity is not None else None
+        for _ in range(k_bptt):
+            with torch.inference_mode(False), torch.enable_grad():
+                if not param.requires_grad:
+                    param = param.detach().requires_grad_(True)
+                g = torch.autograd.grad(energy_fn(param), param, create_graph=True)[0]
+                param, velocity = self._inner_step(param, g, velocity, detach_grad=False)
+        return param
+
     def _infer_one_frame(self, x_img, init_param, return_recon=False):
         """Iterative inference for one frame, stepping the natural parameter eta
         to DESCEND reconstruction error (param <- param - lr * dR/deta). First-
-        order / detached inner steps: the gradient is computed on a detached,
-        requires_grad copy and applied with .detach(), so the returned posterior
-        is differentiable only w.r.t. the prior (NOT the decoder) — this gives the
-        decoder zero gradient from the downstream predictive term (spec §2.3).
+        order / detached inner steps when ``infer_backprop`` is false, or a
+        differentiable K-step unroll when it is true.
         x_img: (N, C, H, W). init_param: (N, P). Returns posterior param (N, P);
         if return_recon, also (R0, RK) per-example recon at eta^(0) and eta^(K)."""
+        init_param = self.head.clamp_param(init_param)
         r0 = self._recon_energy(init_param, x_img, deterministic=True).detach() if return_recon else None
         param = init_param
-        for _ in range(self.k_inner):
-            with torch.enable_grad():
-                p = param.detach().requires_grad_(True)
-                recon = self._recon_energy(p, x_img, reduce_sum=True)
-                g = torch.autograd.grad(recon, p)[0]  # dR/d eta
-            param = self.head.clamp_param(param - self.infer_lr * g.detach())
+        param = self._infer_loop(
+            param,
+            x_img,
+            lambda p: self._recon_energy(p, x_img, reduce_sum=True),
+        )
         if return_recon:
             rK = self._recon_energy(param, x_img, deterministic=True).detach()
             return param, r0, rK
@@ -169,6 +244,7 @@ class FONDJEPA(nn.Module):
                 "encode() is the parallel static-prior path (scheme B). For "
                 "predictive_prior (scheme A) use filter_sequence() — the sequential "
                 "online-filtering loop. See IMPLEMENTED_OBJECTIVE.md")
+        init = self.head.clamp_param(init)
         out = self._infer_one_frame(flat, init, return_recon=return_diag)
         if return_diag:
             post, r0, rK = out
@@ -185,49 +261,49 @@ class FONDJEPA(nn.Module):
 
     # ---- scheme A: online variational filtering ----------------------------
 
-    def _infer_online(self, x_img, prior, beta_infer, infer_objective, return_diag=False):
+    def _infer_online(self, x_img, prior, beta, infer_objective, return_diag=False):
         """One frame of online VI. Inference is initialized AND priored at the
-        (detached) predictive prior. The inner energy is
+        predictive prior. The inner energy is
 
-            free_energy : F(eta) = R(eta; x) + beta_infer * KL(q_eta || q_prior)
+            free_energy : F(eta) = R(eta; x) + beta * KL(q_eta || q_prior)
             recon_only  : F(eta) = R(eta; x)                       (no prior pull)
 
-        descended by first-order detached steps (decoder gets no gradient). With
+        descended by inner inference steps. With
         K=0 the posterior == prior (zero_step). Returns posterior (N,P); if
         return_diag also per-example (R0, RK, F0, FK, KL_K) at eta^(0)=prior and
         eta^(K)."""
-        use_kl = (infer_objective == "free_energy" and beta_infer > 0)
+        use_kl = (infer_objective == "free_energy" and beta > 0)
+        prior = self.head.clamp_param(prior)
         param = prior
         diag = None
         if return_diag:
             r0 = self._recon_energy(prior, x_img, deterministic=True).detach()   # (N,)
             f0 = r0.clone()   # KL(prior||prior) = 0 at eta^(0)
-        for _ in range(self.k_inner):
-            with torch.enable_grad():
-                p = param.detach().requires_grad_(True)
-                energy = self._recon_energy(p, x_img, reduce_sum=True)
-                if use_kl:
-                    energy = energy + beta_infer * self.head.kl_energy(p, prior)
-                g = torch.autograd.grad(energy, p)[0]
-            param = self.head.clamp_param(param - self.infer_lr * g.detach())
+        def energy_fn(p):
+            energy = self._recon_energy(p, x_img, reduce_sum=True)
+            if use_kl:
+                energy = energy + beta * self.head.kl_energy(p, prior)
+            return energy
+
+        param = self._infer_loop(param, x_img, energy_fn)
         if return_diag:
             with torch.no_grad():
                 rK = self._recon_energy(param, x_img, deterministic=True)        # (N,)
                 klK = self.head.kl_perexample(param, prior)                       # (N,)
-                fK = rK + (beta_infer * klK if use_kl else 0.0)
+                fK = rK + (beta * klK if use_kl else 0.0)
             diag = {"R0": r0, "RK": rK, "F0": f0, "FK": fK, "KL_K": klK}
             return param, diag
         return param
 
-    def filter_sequence(self, batch, history_size, beta_infer=1.0,
+    def filter_sequence(self, batch, history_size, beta=1.0,
                         infer_objective="free_energy", return_diag=True):
         """Sequential online-VI filter (scheme A). For each frame t:
           eta_hat_t = static prior (t=0) or predictor(eta_{<t window}, a_{<t})
-          eta_t     = infer(x_t, init=prior=eta_hat_t.detach(), objective)
+          eta_t     = infer(x_t, init=prior=eta_hat_t, objective)
           eta_prev  = stopgrad(eta_t)
-        The predictor prior is detached inside inference (no grad through target
-        construction); the predictor still receives gradient via the predictive
-        loss outside, where the target eta_t is detached and eta_hat_t is not.
+        The predictor-context buffer is detached so past inference is not
+        backpropagated through. For ``infer_backprop=False`` the current prior is
+        detached too, reproducing the old first-order ablation.
         Returns info with emb (posteriors, B,T,P) and pred_hat (predictions, B,T,P)."""
         pixels = batch["pixels"].float()
         B, T = pixels.shape[:2]
@@ -245,8 +321,8 @@ class FONDJEPA(nn.Module):
                 hist = torch.stack(buffer[-h:], dim=1)         # (B,h,P) detached
                 act_h = act_emb[:, t - h:t]                    # (B,h,P) actions a_{t-h..t-1}
                 ehat = self.predict(hist, act_h)[:, -1]        # (B,P) prediction of frame t
-            prior = ehat.detach()
-            out = self._infer_online(x_t, prior, beta_infer, infer_objective, return_diag=return_diag)
+            prior = ehat if self.infer_backprop else ehat.detach()
+            out = self._infer_online(x_t, prior, beta, infer_objective, return_diag=return_diag)
             if return_diag:
                 eta, d = out
                 for k in d_acc:
@@ -267,7 +343,7 @@ class FONDJEPA(nn.Module):
         return info
 
     @torch.no_grad()
-    def action_prior_report(self, batch, eta, history_size, beta_infer):
+    def action_prior_report(self, batch, eta, history_size, beta):
         """Innovation / action-conditioning diagnostics for online filtering.
 
         D_pred in scheme A is an INNOVATION size (eta_t is inferred from eta_hat_t),
@@ -311,7 +387,7 @@ class FONDJEPA(nn.Module):
         m["F_prior_true"] = m["R_prior_true"]
         m["F_prior_shuffle"] = m["R_prior_shuffle"]
         m["F_prior"] = m["R_prior_true"]
-        m["F_post"] = m["R_post"] + beta_infer * m["innovation_kl"]
+        m["F_post"] = m["R_post"] + beta * m["innovation_kl"]
         m["R_prior"] = m["R_prior_true"]
         # action gains (positive => true action helps explain the real next obs).
         # F gains equal R gains for the prior (self-KL=0) but logged for completeness.
@@ -335,8 +411,82 @@ class FONDJEPA(nn.Module):
         preds = self.pred_proj(rearrange(preds, "b t d -> (b t) d"))
         return rearrange(preds, "(b t) d -> b t d", b=emb.size(0))
 
-    # rollout / criterion / get_cost inherited-by-reference (operate on emb);
-    # the KL terminal cost for planning (spec §5.5) is added in a later stage.
+
+    # ---- planning / evaluation --------------------------------------------
+
+    def rollout(self, info, action_sequence, history_size: int = 3):
+        """Autoregressive latent rollout for planning, matching JEPA.rollout.
+
+        FOND encodes the initial observation history by inner inference, then uses
+        the shared predictor/action_encoder path for candidate action rollouts.
+        """
+        assert "pixels" in info, "pixels not in info_dict"
+        H = info["pixels"].size(2)
+        B, S, T = action_sequence.shape[:3]
+        act_0, act_future = torch.split(action_sequence, [H, T - H], dim=2)
+        info["action"] = act_0
+        n_steps = T - H
+
+        init = {k: v[:, 0] for k, v in info.items() if torch.is_tensor(v)}
+        init = self.encode(init)
+        emb = info["emb"] = init["emb"].unsqueeze(1).expand(B, S, -1, -1)
+
+        emb = rearrange(emb, "b s ... -> (b s) ...").clone()
+        act = rearrange(act_0, "b s ... -> (b s) ...")
+        act_future = rearrange(act_future, "b s ... -> (b s) ...")
+
+        HS = history_size
+        for t in range(n_steps):
+            act_emb = self.action_encoder(act)
+            pred_emb = self.predict(emb[:, -HS:], act_emb[:, -HS:])[:, -1:]
+            emb = torch.cat([emb, pred_emb], dim=1)
+            act = torch.cat([act, act_future[:, t:t + 1]], dim=1)
+
+        act_emb = self.action_encoder(act)
+        pred_emb = self.predict(emb[:, -HS:], act_emb[:, -HS:])[:, -1:]
+        emb = torch.cat([emb, pred_emb], dim=1)
+
+        info["predicted_emb"] = rearrange(emb, "(b s) ... -> b s ...", b=B, s=S)
+        return info
+
+    def criterion(self, info_dict: dict):
+        """Terminal planning cost in the latent family natural-parameter space."""
+        pred = info_dict["predicted_emb"][..., -1, :]  # (B,S,P)
+        goal = info_dict["goal_emb"][..., -1:, :].expand_as(info_dict["predicted_emb"])[..., -1, :]
+        flat_goal = rearrange(goal, "b s p -> (b s) p")
+        flat_pred = rearrange(pred, "b s p -> (b s) p")
+        if hasattr(self.head, "kl_perexample"):
+            cost = self.head.kl_perexample(flat_goal, flat_pred)
+        else:
+            cost = (flat_goal - flat_pred).pow(2).sum(-1)
+        return rearrange(cost, "(b s) -> b s", b=pred.size(0), s=pred.size(1))
+
+    def get_cost(self, info_dict: dict, action_candidates: torch.Tensor):
+        """Cost of action candidates for stable_worldmodel planning eval."""
+        assert "goal" in info_dict, "goal not in info_dict"
+
+        device = next(self.parameters()).device
+        for k in list(info_dict.keys()):
+            if torch.is_tensor(info_dict[k]):
+                info_dict[k] = info_dict[k].to(device)
+
+        decoder_requires_grad = [p.requires_grad for p in self.decoder.parameters()]
+        self.decoder.requires_grad_(True)
+        try:
+            goal = {k: v[:, 0] for k, v in info_dict.items() if torch.is_tensor(v)}
+            goal["pixels"] = goal["goal"]
+            for k in list(info_dict.keys()):
+                if k.startswith("goal_"):
+                    goal[k[len("goal_"):]] = goal.pop(k)
+            goal.pop("action")
+            goal = self.encode(goal)
+
+            info_dict["goal_emb"] = goal["emb"]
+            info_dict = self.rollout(info_dict, action_candidates)
+            return self.criterion(info_dict)
+        finally:
+            for param, requires_grad in zip(self.decoder.parameters(), decoder_requires_grad):
+                param.requires_grad_(requires_grad)
 
 
 # ----------------------------------------------------------------------------
@@ -363,19 +513,22 @@ def vijepa_forward(self, batch, stage, cfg):
     """Variational JEPA forward. Branches on cfg.loss.target_scheme:
        static_vi_target  (scheme B) : parallel static-prior inference target
        online_filtering  (scheme A) : sequential online-VI filter (main experiment)
-    cfg.loss carries: pred_loss ('exact_kl'|'quadratic_fisher'), kl_weight (beta on
-    the predictive term), recon_weight, and for scheme A: infer_objective
-    ('recon_only'|'free_energy') and beta_infer."""
+    cfg.loss carries: pred_loss ('exact_kl'|'quadratic_fisher'), beta, and for
+    scheme A: infer_objective ('recon_only'|'free_energy')."""
     if cfg.loss.get("target_scheme", "static_vi_target") == "online_filtering":
         return filter_forward(self, batch, stage, cfg)
 
     ctx_len = cfg.history_size
     n_preds = cfg.num_preds
-    beta = cfg.loss.get("kl_weight", 1.0)
-    recon_w = cfg.loss.get("recon_weight", 1.0)
+    beta = float(cfg.loss.beta)
+    self.model.beta = beta
     loss_form = cfg.loss.get("pred_loss", "exact_kl")
     log_diag = cfg.loss.get("log_diag", True)
     head = self.model.head
+    self.model._set_runtime_inference(
+        infer_backprop=cfg.loss.get("infer_backprop", True),
+        k_bptt=cfg.loss.get("k_bptt", self.model.k_inner),
+    )
 
     batch["action"] = torch.nan_to_num(batch["action"], 0.0)
 
@@ -392,14 +545,15 @@ def vijepa_forward(self, batch, stage, cfg):
     tgt_emb = emb[:, n_preds:].detach()
 
     # (1) predictive term: D_pred(posterior || prediction) per (family, loss)
-    output["pred_loss"] = head.pred_term(tgt_emb, pred_emb, loss_form)
+    output["pred_loss"] = head.pred_term(tgt_emb, pred_emb, loss_form, detach_metric=True)
 
     # (2) reconstruction anchor (anti-collapse data term)
     recon = self.model.decode(emb)
     target = _recon_target(batch["pixels"], self.model.img_hw)
+    assert target.min() >= -1e-3 and target.max() <= 1 + 1e-3, "recon target not in [0,1]"
     output["recon_loss"] = F.mse_loss(recon, target)
 
-    output["loss"] = recon_w * output["recon_loss"] + beta * output["pred_loss"]
+    output["loss"] = output["recon_loss"] + beta * output["pred_loss"]
 
     # ---- pre-flight diagnostics (no grad) ----------------------------------
     if log_diag:
@@ -410,7 +564,7 @@ def vijepa_forward(self, batch, stage, cfg):
             output["exact_quad_ratio"] = output["kl_exact"] / (output["fisher_quad"] + 1e-8)
             # §5.2 predictive-degeneracy: predict-no-change baseline
             noop_prior = emb[:, : emb.size(1) - n_preds].detach()
-            output["pred_noop"] = head.pred_term(tgt_emb, noop_prior, loss_form)
+            output["pred_noop"] = head.pred_term(tgt_emb, noop_prior, loss_form, detach_metric=True)
             output["noop_gap"] = output["pred_noop"] - output["pred_loss"]
             output["noop_ratio"] = output["pred_loss"] / (output["pred_noop"] + 1e-8)
             # correction_nontriviality: how far inference moved from its init
@@ -440,31 +594,35 @@ def filter_forward(self, batch, stage, cfg):
     predictive loss trains the predictor toward the stop-grad posterior; the recon
     anchor trains the decoder. Diagnostics use eta_hat_t as the reference point
     (here eta^(0) == eta_hat_t by construction)."""
-    beta = cfg.loss.get("kl_weight", 1.0)
-    recon_w = cfg.loss.get("recon_weight", 1.0)
+    beta = float(cfg.loss.beta)
+    self.model.beta = beta
     loss_form = cfg.loss.get("pred_loss", "exact_kl")
-    beta_infer = cfg.loss.get("beta_infer", 1.0)
     infer_objective = cfg.loss.get("infer_objective", "free_energy")
     log_diag = cfg.loss.get("log_diag", True)
     HS = cfg.history_size
     head = self.model.head
+    self.model._set_runtime_inference(
+        infer_backprop=cfg.loss.get("infer_backprop", True),
+        k_bptt=cfg.loss.get("k_bptt", self.model.k_inner),
+    )
 
     batch["action"] = torch.nan_to_num(batch["action"], 0.0)
 
-    info = self.model.filter_sequence(batch, HS, beta_infer, infer_objective, return_diag=log_diag)
+    info = self.model.filter_sequence(batch, HS, beta, infer_objective, return_diag=log_diag)
     eta = info["emb"]                # (B,T,P) posteriors (detached by construction)
     ehat = info["pred_hat"]          # (B,T,P) predictions (predictor + prior_param grad)
     output = dict(info)
 
     # (1) predictive term over all frames: D_pred(stopgrad(eta_t), eta_hat_t)
-    output["pred_loss"] = head.pred_term(eta.detach(), ehat, loss_form)
+    output["pred_loss"] = head.pred_term(eta.detach(), ehat, loss_form, detach_metric=True)
 
-    # (2) reconstruction anchor (decoder trained here; eta detached)
+    # (2) reconstruction anchor uses graphed eta when infer_backprop=True.
     recon = self.model.decode(eta)
     target = _recon_target(batch["pixels"], self.model.img_hw)
+    assert target.min() >= -1e-3 and target.max() <= 1 + 1e-3, "recon target not in [0,1]"
     output["recon_loss"] = F.mse_loss(recon, target)
 
-    output["loss"] = recon_w * output["recon_loss"] + beta * output["pred_loss"]
+    output["loss"] = output["recon_loss"] + beta * output["pred_loss"]
 
     if log_diag:
         with torch.no_grad():
@@ -476,8 +634,8 @@ def filter_forward(self, batch, stage, cfg):
             # no-op baseline on the t>=1 slice (eta_t vs eta_{t-1}); compare on the
             # same slice so the ratio is apples-to-apples.
             tgt_s, hat_s, prev_s = eta[:, 1:], ehat[:, 1:], eta[:, :-1]
-            output["D_pred_shift"] = head.pred_term(tgt_s, hat_s, loss_form)
-            output["pred_noop"] = head.pred_term(tgt_s, prev_s, loss_form)
+            output["D_pred_shift"] = head.pred_term(tgt_s, hat_s, loss_form, detach_metric=True)
+            output["pred_noop"] = head.pred_term(tgt_s, prev_s, loss_form, detach_metric=True)
             output["noop_ratio"] = output["D_pred_shift"] / (output["pred_noop"] + eps)
             output["noop_gap"] = output["pred_noop"] - output["D_pred_shift"]
             # correction / recon / free-energy gains (vs the predictive prior)
@@ -485,10 +643,12 @@ def filter_forward(self, batch, stage, cfg):
             output["recon_gain"] = output["recon_init"] - output["recon_final"]
             output["F_gain"] = output["F_init"] - output["F_final"]
             output["sat_frac"] = torch.tensor(head.param_stats(eta)["sat_frac"], device=eta.device)
+            output["eta_absmean"] = eta.abs().mean()
+            output["eta_std"] = eta.std()
 
     log_keys = ("loss", "kl_exact", "fisher_quad", "exact_quad_ratio", "pred_noop",
                 "D_pred_shift", "noop_gap", "noop_ratio", "correction_norm",
-                "recon_gain", "F_gain", "sat_frac")
+                "recon_gain", "F_gain", "sat_frac", "eta_absmean", "eta_std")
     losses = {f"{stage}/{k}": v.detach() for k, v in output.items()
               if torch.is_tensor(v) and v.ndim == 0 and ("loss" in k or k in log_keys)}
     self.log_dict(losses, on_step=True, sync_dist=True)

@@ -14,3 +14,4 @@ wandb_resume.json
 *.h5
 *.h5.zst
 *.mp4
+logs/*

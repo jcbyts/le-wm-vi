@@ -50,10 +50,12 @@ def run_variant(cfg, model_name, pred_loss, batch):
     P = model.param_dim
 
     m = types.SimpleNamespace(model=model, log_dict=lambda *a, **k: None)
+    loss = {"beta": 1.0, "pred_loss": pred_loss}
+    loss_obj = types.SimpleNamespace(**loss)
+    loss_obj.get = lambda k, d=None: loss.get(k, d)
     fcfg = types.SimpleNamespace(
         history_size=cfg.history_size, num_preds=cfg.num_preds,
-        loss=types.SimpleNamespace(get=lambda k, d=None:
-            {"kl_weight": 1.0, "recon_weight": 1.0, "pred_loss": pred_loss}.get(k, d)),
+        loss=loss_obj,
     )
     b = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in batch.items()}
     out = vijepa_forward(m, b, "val", fcfg)

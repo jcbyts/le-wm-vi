@@ -8,18 +8,25 @@ head: gaussian
 infer_init: static_prior   # only used by the static encode() path (scheme B); scheme A inits at the predictive prior
 full_fisher: false         # false = mu-only precision-weighted MSE (gaussian_precision_mse, spec-literal v4)
                            # true  = full 2nd-order Gaussian KL (gaussian_full_fisher_quad)
+fixed_unit_variance: false # true = LeWM identity floor, logvar held at 0 so G = I
 k_inner: 4
 tau: 0.2
-infer_lr: 1.0
+infer_lr: 0.3
+infer_grad_clip: 1.0
+infer_momentum: 0.5
 img_ch: 3
 img_hw: ${img_size}
 
 decoder:
-  _target_: model.ConvDecoder
+  _target_: vit_decoder.ViTDecoder
   latent_dim: ${embed_dim}
+  dim: ${embed_dim}
+  depth: 6
+  heads: 6
+  mlp_dim: 768
   img_ch: 3
-  img_hw: ${img_size}
-  grid: 8
+  img_hw: 64
+  patch_size: 8
 
 predictor:
   _target_: module.ARPredictor

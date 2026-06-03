@@ -1,10 +1,8 @@
 """Reduced online-filtering (scheme A) pilot — find the stable window.
 
-Grid (NOT the full static 60-grid): families {poisson, gaussian} x loss {exact_kl}
-x infer_objective {recon_only, free_energy} x K {1,4,8} x beta_infer {0.1,1,3}
-x recon_weight {1e-3, 1e-2}. beta_infer is swept only for free_energy (it does not
-enter recon_only inference) -> 48 configs. Trains each fresh on a TINY PushT subset
-then logs the diagnostic row on a held-out batch.
+Stability grid: families {poisson, gaussian} x loss {exact_kl} x
+infer_objective {free_energy} x K {4,8} x beta {0.1,1.0,10.0} x infer_lr {0.05,0.1,0.3}. Trains each fresh on a
+TINY PushT subset then logs the diagnostic row on a held-out batch.
 
 Hard diagnostic (spec / user): a row with rate_max >= exp(5) is flagged SATURATED.
 
@@ -36,11 +34,13 @@ STEPS = int(os.environ.get("SWEEP_STEPS", "150"))
 QUICK = os.environ.get("SWEEP_QUICK", "") != ""
 EMBED_DIM, HISTORY, NUM_PREDS, IMG = 192, 3, 1, 64
 N_TINY, BATCH = (128, 16) if QUICK else (512, 32)
-K_GRID = [4] if QUICK else [1, 4, 8]
-BETA_GRID = [1.0] if QUICK else [0.1, 1.0, 3.0]
-RW_GRID = [1e-3] if QUICK else [1e-3, 1e-2]
+K_GRID = [4] if QUICK else [4, 8]
+BETA_GRID = [10.0] if QUICK else [0.1, 1.0, 10.0]
+LR_GRID = [0.1] if QUICK else [0.05, 0.1, 0.3]
 FAMILIES = ["poisson", "gaussian"]
-OBJECTIVES = ["recon_only", "free_energy"]
+OBJECTIVES = ["free_energy"]
+INFER_GRAD_CLIP = 1.0
+INFER_MOMENTUM = 0.5
 SAT_RATE = math.exp(5.0)
 if QUICK:
     STEPS = 20
@@ -66,7 +66,7 @@ def tiny_loader():
     return loader, act_in
 
 
-def build_model(family, K, act_in):
+def build_model(family, K, infer_lr, act_in):
     head = make_head(family)
     P = EMBED_DIM * head.param_mult
     predictor = ARPredictor(num_frames=HISTORY, input_dim=P, hidden_dim=EMBED_DIM,
@@ -75,28 +75,30 @@ def build_model(family, K, act_in):
     action_encoder = Embedder(input_dim=act_in, emb_dim=P)
     decoder = ConvDecoder(EMBED_DIM, img_ch=3, img_hw=IMG, grid=8)
     return FONDJEPA(decoder=decoder, predictor=predictor, action_encoder=action_encoder,
-                    latent_dim=EMBED_DIM, head=head, k_inner=K, tau=0.2, infer_lr=1.0,
+                    latent_dim=EMBED_DIM, head=head, k_inner=K, tau=0.2, infer_lr=infer_lr,
+                    infer_grad_clip=INFER_GRAD_CLIP, infer_momentum=INFER_MOMENTUM,
                     infer_init="predictive_prior", img_ch=3, img_hw=IMG).to(DEVICE)
 
 
-def cfg_obj(rw, beta_infer, infer_objective, log_diag):
-    d = {"kl_weight": 1.0, "recon_weight": rw, "pred_loss": "exact_kl",
+def cfg_obj(beta, infer_objective, log_diag):
+    d = {"beta": beta, "pred_loss": "exact_kl",
          "target_scheme": "online_filtering", "infer_objective": infer_objective,
-         "beta_infer": beta_infer, "log_diag": log_diag}
-    return types.SimpleNamespace(history_size=HISTORY, num_preds=NUM_PREDS,
-                                 loss=types.SimpleNamespace(get=lambda k, dd=None: d.get(k, dd)))
+         "log_diag": log_diag}
+    loss_obj = types.SimpleNamespace(**d)
+    loss_obj.get = lambda k, dd=None: d.get(k, dd)
+    return types.SimpleNamespace(history_size=HISTORY, num_preds=NUM_PREDS, loss=loss_obj)
 
 
 def to_dev(batch):
     return {k: (v.to(DEVICE) if torch.is_tensor(v) else v) for k, v in batch.items()}
 
 
-def run_config(family, obj, K, beta, rw, loader, act_in, eval_batch):
+def run_config(family, obj, K, beta, infer_lr, loader, act_in, eval_batch):
     torch.manual_seed(0)
-    model = build_model(family, K, act_in)
+    model = build_model(family, K, infer_lr, act_in)
     wrap = types.SimpleNamespace(model=model, log_dict=lambda *a, **k: None)
     opt = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-3)
-    fcfg = cfg_obj(rw, beta, obj, log_diag=False)
+    fcfg = cfg_obj(beta, obj, log_diag=False)
     data = itertools.cycle(loader)
     model.train()
     nonfinite = False
@@ -111,7 +113,7 @@ def run_config(family, obj, K, beta, rw, loader, act_in, eval_batch):
     model.eval()
     with torch.no_grad():
         eb = to_dev(eval_batch)
-        out = vijepa_forward(wrap, eb, "val", cfg_obj(rw, beta, obj, log_diag=True))
+        out = vijepa_forward(wrap, eb, "val", cfg_obj(beta, obj, log_diag=True))
         emb = out["emb"]; rep = collapse_report(emb); stats = model.head.param_stats(emb)
         ap = model.action_prior_report(eb, emb, HISTORY, beta)
     g = lambda k: float(out[k].item()) if k in out and torch.is_tensor(out[k]) else float("nan")
@@ -133,7 +135,10 @@ def run_config(family, obj, K, beta, rw, loader, act_in, eval_batch):
              and ap["action_gain_vs_noop"] > 0)               # true action beats no-op
     return {
         "scheme": "online", "variant": variant_name(family, "exact_kl"),
-        "infer_obj": obj, "K": K, "beta_inf": beta, "recon_w": rw, "nonfinite": int(nonfinite),
+        "infer_obj": obj, "K": K, "beta": beta,
+        "infer_lr": infer_lr, "infer_grad_clip": INFER_GRAD_CLIP,
+        "infer_momentum": INFER_MOMENTUM, "detach_metric": 1,
+        "nonfinite": int(nonfinite),
         "rank_frac": round(rep["eff_rank_frac"], 3),
         "var_med": f"{rep['batch_var_median']:.2e}", "temp_var": f"{rep['temporal_var_mean']:.2e}",
         "collapse_pass": int(rep["passed"]),
@@ -164,24 +169,25 @@ def main():
     loader, act_in = tiny_loader()
     eval_batch = next(iter(loader))
     combos = []
-    for family, rw, K in itertools.product(FAMILIES, RW_GRID, K_GRID):
+    for family, K, infer_lr in itertools.product(FAMILIES, K_GRID, LR_GRID):
         for beta in BETA_GRID:
-            combos.append((family, "free_energy", K, beta, rw))
-        combos.append((family, "recon_only", K, BETA_GRID[len(BETA_GRID) // 2], rw))
+            combos.append((family, "free_energy", K, beta, infer_lr))
     print(f"{len(combos)} configs")
     rows = []
-    for i, (family, obj, K, beta, rw) in enumerate(combos):
+    for i, (family, obj, K, beta, infer_lr) in enumerate(combos):
         try:
-            row = run_config(family, obj, K, beta, rw, loader, act_in, eval_batch)
+            row = run_config(family, obj, K, beta, infer_lr, loader, act_in, eval_batch)
         except Exception as e:
             row = {"scheme": "online", "variant": variant_name(family, "exact_kl"),
-                   "infer_obj": obj, "K": K, "beta_inf": beta, "recon_w": rw,
+                   "infer_obj": obj, "K": K, "beta": beta,
+                   "infer_lr": infer_lr, "infer_grad_clip": INFER_GRAD_CLIP,
+                   "infer_momentum": INFER_MOMENTUM, "detach_metric": 1,
                    "nonfinite": 1, "error": str(e)[:80]}
         rows.append(row)
         flag = (" *** SATURATED ***" if row.get("SATURATED") else "") + (" <CLEAN>" if row.get("CLEAN") else "")
         print(f"[{i+1}/{len(combos)}] {row}{flag}")
 
-    cols = ["scheme", "variant", "infer_obj", "K", "beta_inf", "recon_w", "nonfinite",
+    cols = ["scheme", "variant", "infer_obj", "K", "beta", "nonfinite",
             "rank_frac", "var_med", "temp_var", "collapse_pass", "corr_norm", "innov_kl",
             "R_prior", "R_post", "recon_gain", "F_prior", "F_post", "F_gain",
             "R_pr_true", "R_pr_shuf", "R_pr_noop", "act_gain_R", "act_gain_F", "act_gain_noop",

@@ -1,7 +1,7 @@
-"""Tiny K/recon_weight sweep to find the stable window (NOT a performance run).
+"""Tiny K/beta sweep to find the stable window (NOT a performance run).
 
 For families {gaussian, poisson} x loss {exact_kl} x K {1,2,4,8,16} x
-recon_weight {1e-4,3e-4,1e-3,3e-3,1e-2,3e-2}: train a fresh model for a few
+beta {1e-4,3e-4,1e-3,3e-3,1e-2,3e-2}: train a fresh model for a few
 hundred steps on a TINY PushT subset, then log the full diagnostic row on a
 held-out batch. The window we want passes ALL of:
   - collapse gate (rank/var/temporal),
@@ -41,7 +41,7 @@ QUICK = os.environ.get("SWEEP_QUICK", "") != ""
 EMBED_DIM, HISTORY, NUM_PREDS, IMG = 192, 3, 1, 64
 N_TINY, BATCH = (128, 16) if QUICK else (512, 32)
 K_GRID = [4] if QUICK else [1, 2, 4, 8, 16]
-RW_GRID = [1e-3, 1e-2] if QUICK else [1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2]
+BETA_GRID = [1e-3, 1e-2] if QUICK else [1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2]
 FAMILIES = ["poisson", "gaussian"]
 if QUICK:
     STEPS = 20
@@ -76,27 +76,29 @@ def build_model(family, K, act_in):
     action_encoder = Embedder(input_dim=act_in, emb_dim=P)
     decoder = ConvDecoder(EMBED_DIM, img_ch=3, img_hw=IMG, grid=8)
     return FONDJEPA(decoder=decoder, predictor=predictor, action_encoder=action_encoder,
-                    latent_dim=EMBED_DIM, head=head, k_inner=K, tau=0.2, infer_lr=1.0,
+                    latent_dim=EMBED_DIM, head=head, k_inner=K, tau=0.2,
+                    infer_lr=0.1 if family == "poisson" else 0.3,
+                    infer_grad_clip=1.0, infer_momentum=0.5,
                     img_ch=3, img_hw=IMG).to(DEVICE)
 
 
-def cfg_obj(recon_weight, log_diag):
-    d = {"kl_weight": 1.0, "recon_weight": recon_weight, "pred_loss": "exact_kl",
-         "log_diag": log_diag}
-    return types.SimpleNamespace(history_size=HISTORY, num_preds=NUM_PREDS,
-                                 loss=types.SimpleNamespace(get=lambda k, dd=None: d.get(k, dd)))
+def cfg_obj(beta, log_diag):
+    d = {"beta": beta, "pred_loss": "exact_kl", "log_diag": log_diag}
+    loss_obj = types.SimpleNamespace(**d)
+    loss_obj.get = lambda k, dd=None: d.get(k, dd)
+    return types.SimpleNamespace(history_size=HISTORY, num_preds=NUM_PREDS, loss=loss_obj)
 
 
 def to_dev(batch):
     return {k: (v.to(DEVICE) if torch.is_tensor(v) else v) for k, v in batch.items()}
 
 
-def run_config(family, K, rw, loader, act_in, eval_batch):
+def run_config(family, K, beta, loader, act_in, eval_batch):
     torch.manual_seed(0)
     model = build_model(family, K, act_in)
     wrap = types.SimpleNamespace(model=model, log_dict=lambda *a, **k: None)
     opt = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-3)
-    fcfg_train = cfg_obj(rw, log_diag=False)
+    fcfg_train = cfg_obj(beta, log_diag=False)
 
     data = itertools.cycle(loader)
     model.train()
@@ -114,14 +116,14 @@ def run_config(family, K, rw, loader, act_in, eval_batch):
 
     model.eval()
     with torch.no_grad():
-        out = vijepa_forward(wrap, to_dev(eval_batch), "val", cfg_obj(rw, log_diag=True))
+        out = vijepa_forward(wrap, to_dev(eval_batch), "val", cfg_obj(beta, log_diag=True))
         emb = out["emb"]
         rep = collapse_report(emb)
         stats = model.head.param_stats(emb)
     g = lambda k: float(out[k].item()) if k in out and torch.is_tensor(out[k]) else float("nan")
     row = {
         "variant": variant_name(family, "exact_kl"),
-        "K": K, "recon_w": rw, "nonfinite": int(nonfinite),
+        "K": K, "beta": beta, "nonfinite": int(nonfinite),
         "rank_frac": round(rep["eff_rank_frac"], 3),
         "var_med": f"{rep['batch_var_median']:.2e}",
         "temp_var": f"{rep['temporal_var_mean']:.2e}",
@@ -145,17 +147,17 @@ def main():
     loader, act_in = tiny_loader()
     eval_batch = next(iter(loader))      # fixed held-out-ish batch for all configs
     rows = []
-    combos = list(itertools.product(FAMILIES, K_GRID, RW_GRID))
-    for i, (family, K, rw) in enumerate(combos):
+    combos = list(itertools.product(FAMILIES, K_GRID, BETA_GRID))
+    for i, (family, K, beta) in enumerate(combos):
         try:
-            row = run_config(family, K, rw, loader, act_in, eval_batch)
+            row = run_config(family, K, beta, loader, act_in, eval_batch)
         except Exception as e:
-            row = {"variant": variant_name(family, "exact_kl"), "K": K, "recon_w": rw,
+            row = {"variant": variant_name(family, "exact_kl"), "K": K, "beta": beta,
                    "nonfinite": 1, "error": str(e)[:60]}
         rows.append(row)
         print(f"[{i+1}/{len(combos)}] {row}")
 
-    cols = ["variant", "K", "recon_w", "nonfinite", "rank_frac", "var_med", "temp_var",
+    cols = ["variant", "K", "beta", "nonfinite", "rank_frac", "var_med", "temp_var",
             "collapse_pass", "corr_norm", "recon_gain", "D_pred", "D_noop", "noop_ratio",
             "kl_exact", "fisher_q", "exact/quad", "sat_frac", "rate_or_lv_max"]
     with open("fond_sweep_results.csv", "w", newline="") as f:

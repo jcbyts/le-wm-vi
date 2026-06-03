@@ -18,8 +18,10 @@ Every head provides (all operate on the LAST dim; batch/time dims pass through):
 Conventions fixed by the spec (do NOT vary):
   - KL direction: D_KL(posterior || prior), posterior is the FIRST argument.
   - The quadratic metric is evaluated at the REFERENCE (prior) parameters.
-  - The weight in the quadratic is NOT stop-gradiented (the metric is part of the
-    model); the posterior target detach is the caller's job, not the head's.
+  - In inference losses, the weight in the quadratic is NOT stop-gradiented (the
+    metric is part of the model); the posterior target detach is the caller's
+    job, not the head's. Predictive losses may request detach_metric=True because
+    their reference argument is the trainable prediction, not a fixed prior.
 
 All reductions: sum over the parameter (feature) dim, mean over batch/time. The
 heads are pure functions of (post, prior) tensors — detaching the target is done
@@ -37,19 +39,21 @@ LV_LO, LV_HI = -10.0, 5.0         # logvar clamp (Gaussian)
 # Poisson machinery (ported verbatim from validated iP-VAE code)
 # ----------------------------------------------------------------------------
 
-def poisson_kl(log_post, log_prior):
+def poisson_kl(log_post, log_prior, detach_metric=False):
     """Exact Poisson KL( Pois(e^log_post) || Pois(e^log_prior) ), elementwise."""
     log_post = log_post.clamp(LOG_LO, LOG_HI)
     log_prior = log_prior.clamp(LOG_LO, LOG_HI)
-    lam_post, lam_prior = torch.exp(log_post), torch.exp(log_prior)
+    log_prior_metric = log_prior.detach() if detach_metric else log_prior
+    lam_post, lam_prior = torch.exp(log_post), torch.exp(log_prior_metric)
     return lam_post * (log_post - log_prior) - (lam_post - lam_prior)
 
 
-def poisson_fisher_quad(log_post, log_prior):
+def poisson_fisher_quad(log_post, log_prior, detach_metric=False):
     """Local (Fisher) reading: 1/2 * e^prior * (post - prior)^2, elementwise.
     Fisher of independent Poisson in log-rate coords is diag(e^u), evaluated at
     the reference (prior). Numerically robust at small delta (no cancellation)."""
-    log_prior_c = log_prior.clamp(LOG_LO, LOG_HI)
+    log_prior_ref = log_prior.detach() if detach_metric else log_prior
+    log_prior_c = log_prior_ref.clamp(LOG_LO, LOG_HI)
     delta = log_post - log_prior
     return 0.5 * torch.exp(log_prior_c) * delta.pow(2)
 
@@ -92,17 +96,22 @@ def _split_gaussian(param):
     return mu, logvar
 
 
-def gaussian_kl(post, prior):
+def gaussian_kl(post, prior, fixed_unit_variance=False, detach_metric=False):
     """Exact KL( N(mu,Sigma) || N(mu_hat,Sigma_hat) ), diagonal, elementwise.
     post/prior are (..., 2D) = concat(mu, logvar)."""
     mu, lv = _split_gaussian(post)
     mu_h, lv_h = _split_gaussian(prior)
+    if fixed_unit_variance:
+        lv = torch.zeros_like(lv)
+        lv_h = torch.zeros_like(lv_h)
     lv = lv.clamp(LV_LO, LV_HI)
     lv_h = lv_h.clamp(LV_LO, LV_HI)
-    return 0.5 * (lv_h - lv + (torch.exp(lv) + (mu - mu_h).pow(2)) * torch.exp(-lv_h) - 1.0)
+    lv_h_metric = lv_h.detach() if detach_metric else lv_h
+    return 0.5 * (lv_h - lv + (torch.exp(lv) + (mu - mu_h).pow(2)) * torch.exp(-lv_h_metric) - 1.0)
 
 
-def gaussian_fisher_quad(post, prior, include_var=True):
+def gaussian_fisher_quad(post, prior, include_var=True, detach_metric=False,
+                         fixed_unit_variance=False):
     """Local (Fisher) quadratic form, elementwise.
 
     Fisher of a diagonal Gaussian in (mu, logvar) coords is diag(1/sigma^2, 1/2),
@@ -117,13 +126,18 @@ def gaussian_fisher_quad(post, prior, include_var=True):
     include_var=False -> the spec §2.1 literal "precision-weighted MSE" (mu only);
                          does NOT track the exact KL when the variance moves.
 
-    The weights are NOT detached (the metric is part of the model)."""
-    mu, _ = _split_gaussian(post)
+    The weights are NOT detached by default (the metric is part of the model).
+    Predictive losses pass detach_metric=True so the trained prior/prediction only
+    receives the residual gradient, not a curvature-shrinking side channel."""
+    mu, lv = _split_gaussian(post)
     mu_h, lv_h = _split_gaussian(prior)
-    lv_h = lv_h.clamp(LV_LO, LV_HI)
-    q = 0.5 * (mu - mu_h).pow(2) * torch.exp(-lv_h)
+    if fixed_unit_variance:
+        lv = torch.zeros_like(lv)
+        lv_h = torch.zeros_like(lv_h)
+    lv_h_ref = lv_h.detach() if detach_metric else lv_h
+    lv_h_c = lv_h_ref.clamp(LV_LO, LV_HI)
+    q = 0.5 * (mu - mu_h).pow(2) * torch.exp(-lv_h_c)
     if include_var:
-        _, lv = _split_gaussian(post)
         q = q + 0.25 * (lv.clamp(LV_LO, LV_HI) - lv_h).pow(2)
     return q
 
@@ -169,7 +183,7 @@ class LatentHead:
         Used where a deterministic code is needed (e.g. the mean)."""
         raise NotImplementedError
 
-    def pred_term(self, post, prior, loss):
+    def pred_term(self, post, prior, loss, detach_metric=False):
         """D_pred per (family, loss). `loss` in {mse, exact_kl, quadratic_fisher}.
         Sum over feature dim, mean over batch/time."""
         raise NotImplementedError
@@ -191,7 +205,7 @@ class DeterministicHead(LatentHead):
     def to_code(self, param):
         return param
 
-    def pred_term(self, post, prior, loss):
+    def pred_term(self, post, prior, loss, detach_metric=False):
         assert loss == "mse", f"deterministic head supports loss=mse, got {loss}"
         return (post - prior).pow(2).sum(-1).mean()
 
@@ -207,7 +221,7 @@ class GaussianHead(LatentHead):
     family = "gaussian"
     param_mult = 2
 
-    def __init__(self, tau=0.2, full_fisher=False):
+    def __init__(self, tau=0.2, full_fisher=False, fixed_unit_variance=False):
         super().__init__(tau=tau)
         # DECISION (user): variant 4 uses the spec §2.1 literal mu-only
         # precision-weighted MSE -> full_fisher=False is the default. Caveat
@@ -215,8 +229,16 @@ class GaussianHead(LatentHead):
         # approximation AND a dropped variance-curvature penalty; report it.
         # full_fisher=True is kept as the faithful-2nd-order ablation.
         self.full_fisher = full_fisher
+        self.fixed_unit_variance = fixed_unit_variance
+
+    def _with_unit_variance(self, param):
+        if not self.fixed_unit_variance:
+            return param
+        mu, lv = _split_gaussian(param)
+        return torch.cat([mu, torch.zeros_like(lv)], dim=-1)
 
     def sample(self, param):
+        param = self._with_unit_variance(param)
         mu, lv = _split_gaussian(param)
         lv = lv.clamp(LV_LO, LV_HI)
         eps = torch.randn_like(mu)
@@ -224,6 +246,9 @@ class GaussianHead(LatentHead):
 
     def clamp_param(self, param):
         mu, lv = _split_gaussian(param)
+        mu = mu.clamp(-10.0, 10.0)
+        if self.fixed_unit_variance:
+            return torch.cat([mu, torch.zeros_like(lv)], dim=-1)
         return torch.cat([mu, lv.clamp(LV_LO, LV_HI)], dim=-1)
 
     @torch.no_grad()
@@ -236,27 +261,46 @@ class GaussianHead(LatentHead):
                 "hi_sat_frac": hi, "lo_sat_frac": lo, "mu_absmean": mu.abs().mean().item()}
 
     def to_code(self, param):
+        param = self._with_unit_variance(param)
         mu, _ = _split_gaussian(param)
         return mu
 
-    def pred_term(self, post, prior, loss):
+    def pred_term(self, post, prior, loss, detach_metric=False):
+        post = self._with_unit_variance(post)
+        prior = self._with_unit_variance(prior)
         if loss == "exact_kl":
-            return gaussian_kl(post, prior).sum(-1).mean()
+            return gaussian_kl(
+                post, prior, self.fixed_unit_variance, detach_metric=detach_metric
+            ).sum(-1).mean()
         if loss == "quadratic_fisher":
-            return gaussian_fisher_quad(post, prior, self.full_fisher).sum(-1).mean()
+            return gaussian_fisher_quad(
+                post, prior, self.full_fisher, detach_metric, self.fixed_unit_variance
+            ).sum(-1).mean()
         raise ValueError(f"gaussian head: unknown loss {loss}")
 
     def kl_exact(self, post, prior):
-        return gaussian_kl(post, prior).sum(-1).mean()
+        return gaussian_kl(
+            self._with_unit_variance(post), self._with_unit_variance(prior),
+            self.fixed_unit_variance,
+        ).sum(-1).mean()
 
     def kl_perexample(self, post, prior):
-        return gaussian_kl(post, prior).sum(-1)
+        return gaussian_kl(
+            self._with_unit_variance(post), self._with_unit_variance(prior),
+            self.fixed_unit_variance,
+        ).sum(-1)
 
     def kl_energy(self, post, prior):
-        return gaussian_kl(post, prior).sum()
+        return gaussian_kl(
+            self._with_unit_variance(post), self._with_unit_variance(prior),
+            self.fixed_unit_variance,
+        ).sum()
 
     def fisher_quad(self, post, prior):
-        return gaussian_fisher_quad(post, prior, self.full_fisher).sum(-1).mean()
+        return gaussian_fisher_quad(
+            self._with_unit_variance(post), self._with_unit_variance(prior),
+            self.full_fisher, fixed_unit_variance=self.fixed_unit_variance,
+        ).sum(-1).mean()
 
 
 class PoissonHead(LatentHead):
@@ -286,11 +330,11 @@ class PoissonHead(LatentHead):
         # deterministic code = the rate itself (clamped), differentiable in u
         return torch.exp(param.clamp(LOG_LO, LOG_HI))
 
-    def pred_term(self, post, prior, loss):
+    def pred_term(self, post, prior, loss, detach_metric=False):
         if loss == "exact_kl":
-            return poisson_kl(post, prior).sum(-1).mean()
+            return poisson_kl(post, prior, detach_metric=detach_metric).sum(-1).mean()
         if loss == "quadratic_fisher":
-            return poisson_fisher_quad(post, prior).sum(-1).mean()
+            return poisson_fisher_quad(post, prior, detach_metric=detach_metric).sum(-1).mean()
         raise ValueError(f"poisson head: unknown loss {loss}")
 
     def kl_exact(self, post, prior):
@@ -313,11 +357,14 @@ _HEADS = {
 }
 
 
-def make_head(family, tau=0.2, full_fisher=False):
+def make_head(family, tau=0.2, full_fisher=False, fixed_unit_variance=False):
     if family not in _HEADS:
         raise ValueError(f"unknown latent family {family!r}; choose from {list(_HEADS)}")
     if family == "gaussian":
-        return GaussianHead(tau=tau, full_fisher=full_fisher)
+        return GaussianHead(
+            tau=tau, full_fisher=full_fisher,
+            fixed_unit_variance=fixed_unit_variance,
+        )
     return _HEADS[family](tau=tau)
 
 

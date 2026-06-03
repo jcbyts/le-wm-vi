@@ -20,6 +20,7 @@ import logging
 import tempfile
 
 import torch
+import torch.nn.functional as F
 from lightning.pytorch.callbacks import Callback
 
 import planning
@@ -178,3 +179,126 @@ class BehaviorEvalCallback(Callback):
                     wandb.Video(p, format="mp4") for p in videos[: self.num_videos]
                 ]
             return out
+
+
+class FondVizCallback(Callback):
+    """Per-epoch FOND reconstruction and decoded-rollout visualization."""
+
+    def __init__(self, *, history_size, val_loader, num_frames=8, enabled=True):
+        super().__init__()
+        self.history_size = history_size
+        self.val_loader = val_loader
+        self.num_frames = int(num_frames)
+        self.enabled = enabled
+        self._batch = None
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if not self.enabled or trainer.sanity_checking or not trainer.is_global_zero:
+            return
+        wandb_run = self._get_wandb_run(trainer)
+        if wandb_run is None:
+            return
+        model = pl_module.model
+        if not hasattr(model, "filter_sequence"):
+            return
+        was_training = model.training
+        old_backprop = getattr(model, "infer_backprop", False)
+        model.eval()
+        model.infer_backprop = False
+        try:
+            batch = self._fixed_batch(pl_module.device)
+            payload = self._payload(model, batch)
+            if payload:
+                wandb_run.log(payload, step=trainer.global_step)
+        except Exception as exc:
+            log.warning(f"[fond-viz] validation visualization failed: {exc!r}")
+        finally:
+            model.infer_backprop = old_backprop
+            model.train(was_training)
+
+    def _get_wandb_run(self, trainer):
+        logger = getattr(trainer, "logger", None)
+        exp = getattr(logger, "experiment", None)
+        return exp if exp is not None and hasattr(exp, "log") else None
+
+    def _fixed_batch(self, device):
+        if self._batch is None:
+            self._batch = next(iter(self.val_loader))
+        return {
+            k: (torch.nan_to_num(v.to(device), 0.0) if torch.is_tensor(v) else v)
+            for k, v in self._batch.items()
+        }
+
+    def _payload(self, model, batch):
+        import wandb
+
+        info = model.filter_sequence(
+            batch,
+            self.history_size,
+            beta=float(getattr(model, "beta", 1.0)),
+            infer_objective="free_energy",
+            return_diag=False,
+        )
+        eta = info["emb"]
+        target = batch["pixels"].float().clamp(0.0, 1.0)
+        recon = model.decode(eta).detach().clamp(0.0, 1.0)
+        B, T = eta.shape[:2]
+        n = min(B, 4)
+        t = min(T, self.num_frames)
+
+        flat_eta = eta.detach().reshape(B * T, -1)
+        mu = flat_eta.mean(dim=0, keepdim=True)
+        std = flat_eta.std(dim=0, keepdim=True).clamp_min(1e-4)
+        agg = mu + std * torch.randn(n * t, flat_eta.size(-1), device=flat_eta.device)
+        agg_img = model.decode(agg.view(n, t, -1)).detach().clamp(0.0, 1.0)
+
+        prior = model.prior_param.expand(n * t, -1)
+        prior_img = model.decode(prior.view(n, t, -1)).detach().clamp(0.0, 1.0)
+
+        rollout_true, rollout_pred, mse = self._decoded_rollout(model, batch, eta, info["act_emb"])
+        payload = {
+            "val/recon_input": wandb.Image(self._filmstrip(target[:n, :t])),
+            "val/recon_posterior": wandb.Image(self._filmstrip(recon[:n, :t])),
+            "val/hall_aggpost": wandb.Image(self._filmstrip(agg_img)),
+            "val/hall_prior": wandb.Image(
+                self._filmstrip(prior_img),
+                caption="prior samples (may look unstructured even for a good code)",
+            ),
+            "val/eta_absmean": eta.detach().abs().mean().item(),
+            "val/eta_std": eta.detach().std().item(),
+        }
+        if rollout_true is not None and rollout_pred is not None:
+            payload["val/rollout_true"] = wandb.Image(self._filmstrip(rollout_true[:n]))
+            payload["val/rollout_pred"] = wandb.Image(self._filmstrip(rollout_pred[:n]))
+            for h in (1, 4, 8):
+                if h in mse:
+                    payload[f"val/rollout_mse_h{h}"] = mse[h]
+        return payload
+
+    def _decoded_rollout(self, model, batch, eta, act_emb):
+        HS = self.history_size
+        B, T = eta.shape[:2]
+        if T <= HS:
+            return None, None, {}
+        emb = eta[:, :HS].detach().clone()
+        preds = []
+        for t in range(HS, T):
+            pred = model.predict(emb[:, -HS:], act_emb[:, t - HS:t])[:, -1:]
+            preds.append(pred)
+            emb = torch.cat([emb, pred], dim=1)
+        pred_eta = torch.cat(preds, dim=1)
+        pred_img = model.decode(pred_eta).detach().clamp(0.0, 1.0)
+        true_img = batch["pixels"][:, HS:T].float().clamp(0.0, 1.0)
+        mse = {}
+        for h in (1, 4, 8):
+            idx = h - 1
+            if idx < pred_img.size(1):
+                mse[h] = F.mse_loss(pred_img[:, idx], true_img[:, idx]).item()
+        return true_img, pred_img, mse
+
+    def _filmstrip(self, frames):
+        frames = frames.detach().float().cpu().clamp(0.0, 1.0)
+        if frames.ndim == 4:
+            frames = frames.unsqueeze(0)
+        rows = [torch.cat([frame for frame in seq], dim=2) for seq in frames]
+        return torch.cat(rows, dim=1).permute(1, 2, 0).numpy()
