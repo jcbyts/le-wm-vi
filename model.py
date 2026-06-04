@@ -208,12 +208,13 @@ class FONDJEPA(nn.Module):
             )
 
         if n_detached > 0:
-            param = param.detach().requires_grad_(True)
+            with torch.inference_mode(False):
+                param = param.detach().clone().requires_grad_(True)
             velocity = velocity.detach() if velocity is not None else None
         for _ in range(k_bptt):
             with torch.inference_mode(False), torch.enable_grad():
                 if not param.requires_grad:
-                    param = param.detach().requires_grad_(True)
+                    param = param.detach().clone().requires_grad_(True)
                 g = torch.autograd.grad(energy_fn(param), param, create_graph=True)[0]
                 P = fisher_fn(param) if fisher_fn is not None else None
                 param, velocity = self._inner_step(

@@ -34,6 +34,34 @@ class SIGReg(torch.nn.Module):
         err = (x_t.cos().mean(-3) - self.phi).square() + x_t.sin().mean(-3).square()
         statistic = (err @ self.weights) * proj.size(-2)
         return statistic.mean() # average over projections and time
+
+
+def exponential_sigreg(u, target_rate=1.0):
+    """
+    Poisson-SIGReg: enforce an Exponential marginal over firing rates.
+
+    u: (B, D) log-rates output by the encoder.
+    target_rate: Exponential mean and standard deviation.
+    """
+    u_clamped = u.clamp(-20.0, 5.0)
+    lam = torch.exp(u_clamped)
+
+    B, D = lam.shape
+    lam_mean = lam.mean(dim=0)
+    target = torch.full_like(lam_mean, target_rate)
+
+    mean_loss = F.mse_loss(lam_mean, target)
+    std_loss = F.mse_loss(lam.std(dim=0, unbiased=False), target)
+
+    if B <= 1 or D <= 1:
+        cov_loss = lam.new_zeros(())
+    else:
+        lam_centered = lam - lam_mean
+        cov = (lam_centered.T @ lam_centered) / (B - 1)
+        off_diag = cov.flatten()[:-1].view(D - 1, D + 1)[:, 1:].flatten()
+        cov_loss = off_diag.pow(2).sum() / D
+
+    return mean_loss + std_loss + cov_loss
     
 class FeedForward(nn.Module):
     """FeedForward network used in Transformers"""

@@ -15,7 +15,7 @@ from omegaconf import OmegaConf, open_dict
 
 import planning
 from model import vijepa_forward
-from module import SIGReg
+from module import SIGReg, exponential_sigreg
 from monitor import BehaviorEvalCallback, FondVizCallback
 from utils import get_column_normalizer, get_img_preprocessor, SaveCkptCallback
 
@@ -45,6 +45,39 @@ def lejepa_forward(self, batch, stage, cfg):
     output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
     output["sigreg_loss"]= self.sigreg(emb.transpose(0, 1))
     output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]  
+
+    losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
+    self.log_dict(losses_dict, on_step=True, sync_dist=True)
+    return output
+
+
+def poiswm_forward(self, batch, stage, cfg):
+    """LeWM architecture with exact Poisson KL and Exponential SIGReg."""
+
+    ctx_len = cfg.history_size
+    n_preds = cfg.num_preds
+    beta = cfg.loss.get("beta", 1.0)
+
+    # Replace NaN values with 0 (occurs at sequence boundaries)
+    batch["action"] = torch.nan_to_num(batch["action"], 0.0)
+
+    output = self.model.encode(batch)
+
+    emb = output["emb"]  # (B, T, D), interpreted as Poisson log-rates
+    act_emb = output["act_emb"]
+
+    ctx_emb = emb[:, :ctx_len]
+    ctx_act = act_emb[:, :ctx_len]
+
+    tgt_emb = emb[:, n_preds:].detach()
+    pred_emb = self.model.predict(ctx_emb, ctx_act)
+
+    output["pred_loss"] = self.model._exact_poisson_kl(tgt_emb, pred_emb)
+    output["reg_loss"] = exponential_sigreg(
+        ctx_emb.reshape(-1, ctx_emb.shape[-1]),
+        target_rate=self.model.target_rate,
+    )
+    output["loss"] = output["pred_loss"] + beta * output["reg_loss"]
 
     losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
     self.log_dict(losses_dict, on_step=True, sync_dist=True)
@@ -104,15 +137,22 @@ def run(cfg):
     }
 
     data_module = spt.data.DataModule(train=train, val=val)
-    if cfg.get("forward_type", "lejepa") == "vijepa":
+    forward_type = cfg.get("forward_type", "lejepa")
+    if forward_type == "vijepa":
         # variants 3-6: variational FOND-JEPA, reconstruction anchor, no SIGReg
         world_model = spt.Module(
             model=world_model,
             forward=partial(vijepa_forward, cfg=cfg),
             optim=optimizers,
         )
+    elif forward_type == "poiswm":
+        world_model = spt.Module(
+            model=world_model,
+            forward=partial(poiswm_forward, cfg=cfg),
+            optim=optimizers,
+        )
     else:
-        # variants 1-2: LeWM MSE-JEPA + SIGReg (variant 1 = sigreg.weight 0)
+        # variants 1-2: LeWM MSE-JEPA + SIGReg (variant 1 = sigreg weight 0)
         world_model = spt.Module(
             model=world_model,
             sigreg=SIGReg(**cfg.loss.sigreg.kwargs),

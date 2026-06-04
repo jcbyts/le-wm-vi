@@ -5,6 +5,8 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
 
+from module import exponential_sigreg
+
 def detach_clone(v):
     return v.detach().clone() if torch.is_tensor(v) else v
 
@@ -151,3 +153,46 @@ class JEPA(nn.Module):
         cost = self.criterion(info_dict)
         
         return cost
+
+
+class PoisWM(JEPA):
+    """Amortized Poisson World Model in Poisson log-rate space."""
+
+    def __init__(self, target_rate=1.0, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.target_rate = target_rate
+
+    def _exact_poisson_kl(self, u_tgt, u_pred):
+        """Exact D_KL(Poisson(exp(target)) || Poisson(exp(prediction)))."""
+        u_tgt_c = u_tgt.clamp(-20.0, 5.0)
+        u_pred_c = u_pred.clamp(-20.0, 5.0)
+        lam_tgt = torch.exp(u_tgt_c)
+        lam_pred = torch.exp(u_pred_c)
+        kl = lam_tgt * (u_tgt_c - u_pred_c) - lam_tgt + lam_pred
+        return kl.sum(dim=-1).mean()
+
+    def compute_loss(self, batch, cfg):
+        """Compute the PoisWM predictive KL plus Exponential SIGReg loss."""
+        output = self.encode(batch)
+        emb = output["emb"]
+        act_emb = output.get("act_emb")
+
+        ctx_len = cfg.history_size
+        n_preds = cfg.num_preds
+
+        ctx_emb = emb[:, :ctx_len]
+        ctx_act = act_emb[:, :ctx_len] if act_emb is not None else None
+        tgt_emb = emb[:, n_preds:].detach()
+        pred_emb = self.predict(ctx_emb, ctx_act)
+
+        pred_loss = self._exact_poisson_kl(tgt_emb, pred_emb)
+        reg_loss = exponential_sigreg(
+            ctx_emb.reshape(-1, ctx_emb.shape[-1]),
+            target_rate=self.target_rate,
+        )
+
+        beta = cfg.loss.get("beta", cfg.loss.sigreg.weight if "sigreg" in cfg.loss else 1.0)
+        output["pred_loss"] = pred_loss
+        output["reg_loss"] = reg_loss
+        output["loss"] = pred_loss + beta * reg_loss
+        return output
