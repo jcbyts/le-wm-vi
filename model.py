@@ -37,8 +37,7 @@ from latent import LatentHead, make_head
 # ----------------------------------------------------------------------------
 # Observation model (decoder). Deliberately light (spec §6): its job is to give
 # inference a reconstruction gradient and make a collapsed code reconstructively
-# costly. Capacity lives in the predictor, not here. Outputs [0,1] (Sigmoid) to
-# match the PushT recon target (spec corrections C2).
+# costly. Capacity lives in the predictor, not here.
 # ----------------------------------------------------------------------------
 
 class ConvDecoder(nn.Module):
@@ -525,10 +524,11 @@ class FONDJEPA(nn.Module):
 # ----------------------------------------------------------------------------
 
 def _recon_target(pixels, img_hw):
-    """Low-res [0,1] PushT target for the reconstruction anchor (corrections C2).
-    Expects `pixels` already in [0,1]; downsamples to img_hw if needed.
-    NOTE: the real training transform must supply [0,1] frames (NOT the ViT's
-    ImageNet-normalized tensor) — wired in the training-integration stage."""
+    """Image-space target for the reconstruction anchor.
+
+    The caller controls whether ``pixels`` are raw [0,1] frames or ImageNet-
+    normalized frames. This helper only resizes to the decoder resolution.
+    """
     B, T = pixels.shape[:2]
     flat = rearrange(pixels.float(), "b t c h w -> (b t) c h w")
     if flat.shape[-1] != img_hw:
@@ -577,7 +577,8 @@ def vijepa_forward(self, batch, stage, cfg):
     # (2) reconstruction anchor (anti-collapse data term)
     recon = self.model.decode(emb)
     target = _recon_target(batch["pixels"], self.model.img_hw)
-    assert target.min() >= -1e-3 and target.max() <= 1 + 1e-3, "recon target not in [0,1]"
+    if not getattr(cfg, "normalize_img", False):
+        assert target.min() >= -1e-3 and target.max() <= 1 + 1e-3, "recon target not in [0,1]"
     output["recon_loss"] = F.mse_loss(recon, target)
 
     output["loss"] = output["recon_loss"] + beta * output["pred_loss"]
@@ -646,7 +647,8 @@ def filter_forward(self, batch, stage, cfg):
     # (2) reconstruction anchor uses graphed eta when infer_backprop=True.
     recon = self.model.decode(eta)
     target = _recon_target(batch["pixels"], self.model.img_hw)
-    assert target.min() >= -1e-3 and target.max() <= 1 + 1e-3, "recon target not in [0,1]"
+    if not getattr(cfg, "normalize_img", False):
+        assert target.min() >= -1e-3 and target.max() <= 1 + 1e-3, "recon target not in [0,1]"
     output["recon_loss"] = F.mse_loss(recon, target)
 
     output["loss"] = output["recon_loss"] + beta * output["pred_loss"]

@@ -9,7 +9,7 @@ infer_init: static_prior   # only used by the static encode() path (scheme B); s
 full_fisher: false         # false = mu-only precision-weighted MSE (gaussian_precision_mse, spec-literal v4)
                            # true  = full 2nd-order Gaussian KL (gaussian_full_fisher_quad)
 fixed_unit_variance: false # true = LeWM identity floor, logvar held at 0 so G = I
-k_inner: 4
+k_inner: 2
 tau: 0.2
 infer_lr: 0.3
 infer_grad_clip: 1.0
@@ -25,8 +25,9 @@ decoder:
   heads: 6
   mlp_dim: 768
   img_ch: 3
-  img_hw: 64
-  patch_size: 8
+  img_hw: ${img_size}
+  patch_size: 16
+  output_activation: identity
 
 predictor:
   _target_: module.ARPredictor

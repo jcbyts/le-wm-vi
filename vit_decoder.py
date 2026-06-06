@@ -1,6 +1,6 @@
 """ViT-tiny transpose decoder for FOND-JEPA.
 
-Maps a D-dim latent code to an image in [0, 1]. This is a drop-in replacement
+Maps a D-dim latent code to an image. This is a drop-in replacement
 for ``ConvDecoder`` with the same call contract: ``decoder(code)``.
 
 The attention below is deliberately explicit instead of fused SDPA or
@@ -56,7 +56,7 @@ class _DecBlock(nn.Module):
 
 
 class ViTDecoder(nn.Module):
-    """Latent ``(B, D)`` -> image ``(B, C, hw, hw)`` in [0, 1]."""
+    """Latent ``(B, D)`` -> image ``(B, C, hw, hw)``."""
 
     def __init__(
         self,
@@ -69,13 +69,16 @@ class ViTDecoder(nn.Module):
         img_hw=64,
         patch_size=8,
         dropout=0.0,
+        output_activation="sigmoid",
     ):
         super().__init__()
         assert img_hw % patch_size == 0, "img_hw must be divisible by patch_size"
+        assert output_activation in ("sigmoid", "identity")
         self.dim = dim
         self.img_ch = img_ch
         self.img_hw = img_hw
         self.patch = patch_size
+        self.output_activation = output_activation
         self.gh = img_hw // patch_size
         self.n_tok = self.gh * self.gh
         self.patch_px = patch_size * patch_size * img_ch
@@ -105,4 +108,6 @@ class ViTDecoder(nn.Module):
             pw=self.patch,
             c=self.img_ch,
         )
-        return torch.sigmoid(x)
+        if self.output_activation == "sigmoid":
+            return torch.sigmoid(x)
+        return x

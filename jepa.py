@@ -171,6 +171,20 @@ class PoisWM(JEPA):
         kl = lam_tgt * (u_tgt_c - u_pred_c) - lam_tgt + lam_pred
         return kl.sum(dim=-1).mean()
 
+    def criterion(self, info_dict: dict):
+        """Terminal planning cost in the same Poisson KL geometry as training."""
+        pred_emb = info_dict["predicted_emb"]  # (B,S,T,dim)
+        goal_emb = info_dict["goal_emb"]  # (B,S,T,dim)
+
+        goal_emb = goal_emb[..., -1:, :].expand_as(pred_emb)
+        u_tgt = goal_emb[..., -1, :].detach().clamp(-20.0, 5.0)
+        u_pred = pred_emb[..., -1, :].clamp(-20.0, 5.0)
+
+        lam_tgt = torch.exp(u_tgt)
+        lam_pred = torch.exp(u_pred)
+        kl = lam_tgt * (u_tgt - u_pred) - lam_tgt + lam_pred
+        return kl.sum(dim=-1)  # (B, S)
+
     def compute_loss(self, batch, cfg):
         """Compute the PoisWM predictive KL plus Exponential SIGReg loss."""
         output = self.encode(batch)

@@ -6,7 +6,7 @@ _target_: model.FONDJEPA
 latent_dim: ${embed_dim}
 head: poisson
 infer_init: static_prior   # only used by the static encode() path (scheme B); scheme A inits at the predictive prior
-k_inner: 4
+k_inner: 2
 tau: 0.2
 infer_lr: 0.1
 infer_grad_clip: 1.0
@@ -22,8 +22,9 @@ decoder:
   heads: 6
   mlp_dim: 768
   img_ch: 3
-  img_hw: 64
-  patch_size: 8
+  img_hw: ${img_size}
+  patch_size: 16
+  output_activation: identity
 
 predictor:
   _target_: module.ARPredictor

@@ -95,9 +95,11 @@ def run(cfg):
     dataset = swm.data.load_dataset(
         dataset_name, transform=None, cache_dir=cache_dir, **dataset_cfg
     )
-    # variants 3-6 (vijepa) infer/reconstruct through a decoder in [0,1] pixel
-    # space at low res; variants 1-2 (lejepa) use the ImageNet-normalized ViT path.
-    normalize_img = cfg.get("forward_type", "lejepa") != "vijepa"
+    # Most encoder-only runs use the ImageNet-normalized ViT path. FOND can opt
+    # into either raw [0,1] decoder targets or normalized image-space targets.
+    normalize_img = cfg.get(
+        "normalize_img", cfg.get("forward_type", "lejepa") != "vijepa"
+    )
     transforms = [get_img_preprocessor(source='pixels', target='pixels',
                                        img_size=cfg.img_size, normalize=normalize_img)]
     
@@ -126,6 +128,10 @@ def run(cfg):
     ##############################
 
     world_model = hydra.utils.instantiate(cfg.model)
+    init_weights = cfg.get("init_weights")
+    if init_weights:
+        pretrained = swm.wm.utils.load_pretrained(init_weights)
+        world_model.load_state_dict(pretrained.state_dict())
 
     optimizers = {
         'model_opt': {
@@ -177,7 +183,10 @@ def run(cfg):
         OmegaConf.save(cfg, f)
 
     object_dump_callback = SaveCkptCallback(
-        run_name=cfg.output_model_name, cfg=cfg.model, epoch_interval=1,
+        run_name=cfg.output_model_name,
+        cfg=cfg.model,
+        epoch_interval=1,
+        epoch_offset=cfg.get("ckpt_epoch_offset", 0),
     )
 
     #############################

@@ -22,9 +22,10 @@ forward_type: vijepa            # selects vijepa_forward in train.py
 num_workers: 6
 train_split: 0.9
 seed: 3072
-# Variants 3-6 reconstruct/infer through a low-capacity decoder at low res.
-# Pixels are fed in [0,1] at this resolution (NOT the ViT's 224 ImageNet path).
-img_size: 64
+# Variants 3-6 now reconstruct/infer in the same 224px ImageNet-normalized
+# image space used by the LeWM / ViT path.
+img_size: 224
+normalize_img: true
 embed_dim: 192
 history_size: 3
 
@@ -56,11 +57,11 @@ loss:
   target_scheme: online_filtering   # online_filtering (scheme A, MAIN) | static_vi_target (scheme B, ablation)
   infer_objective: free_energy      # free_energy (R + beta*KL-to-prior) | recon_only
   infer_backprop: true              # differentiable inner inference loop
-  k_bptt: 4                         # BPTT through the final K inner steps
+  k_bptt: 1                         # BPTT through the final K inner steps
   log_viz: true                     # per-epoch FOND recon / hallucination / rollout panels
   viz_num_frames: 8
 
-# Behavioral monitoring for FOND. Uses raw [0,1] 64px pixels via train.py.
+# Behavioral monitoring for FOND. Uses the configured image size / normalization.
 monitor:
   enabled: True
   every_n_epochs: 1
