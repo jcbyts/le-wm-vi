@@ -1,0 +1,37 @@
+# @package _global_
+forward_type: poiswm
+output_model_name: poiswm_conv_rssm
+normalize_img: false
+
+model:
+  _target_: jepa.ConvRSSMPoissonWM
+  img_size: ${img_size}
+  in_channels: 3
+  rate_channels: 64
+  state_dim: 128
+  hidden_channels: [32, 64, 128]
+  lambda0: 1.0
+  log_rate_min: -8.0
+  log_rate_max: 5.0
+  alpha: 3.0
+  target_grid_min: -8.0
+  target_grid_max: 5.0
+  target_grid_size: 65536
+  sigreg_knots: 17
+  sigreg_num_proj: 128
+  goal_cost: compact_mse
+  planner_poisson_weight: 0.0
+  compact_loss_weight: 0.1
+
+  action_encoder:
+    _target_: module.Embedder
+    input_dim: ???
+    emb_dim: 128
+
+loss:
+  beta: 0.05
+  sigreg:
+    weight: 0.09
+    kwargs:
+      knots: 17
+      num_proj: 128

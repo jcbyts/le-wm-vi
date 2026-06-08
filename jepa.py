@@ -581,3 +581,294 @@ class MetabolicSigRegPoisWM(JEPA):
         output.update(self._diagnostics(r_anchor, lam_anchor, lam_pred, beta))
         return output
 
+
+
+class ConvRSSMPoissonWM(nn.Module):
+    """Conv sparse-Poisson perceptual code with compact recurrent dynamics.
+
+    The high-dimensional code is a spatial residual log-rate map trained with
+    exact Poisson KL. The exposed ``emb`` is a compact state used by monitoring
+    and planning, so CEM does not have to optimize directly in raw Poisson
+    firing-rate geometry.
+    """
+
+    def __init__(
+        self,
+        action_encoder,
+        img_size=224,
+        in_channels=3,
+        rate_channels=64,
+        state_dim=128,
+        hidden_channels=(32, 64, 128),
+        lambda0=1.0,
+        log_rate_min=-8.0,
+        log_rate_max=5.0,
+        alpha=3.0,
+        target_grid_min=-8.0,
+        target_grid_max=5.0,
+        target_grid_size=65536,
+        sigreg_knots=17,
+        sigreg_num_proj=128,
+        goal_cost="compact_mse",
+        planner_poisson_weight=0.0,
+        compact_loss_weight=0.1,
+    ):
+        super().__init__()
+        self.action_encoder = action_encoder
+        self.img_size = int(img_size)
+        self.rate_channels = int(rate_channels)
+        self.state_dim = int(state_dim)
+        self.lambda0 = float(lambda0)
+        self.log_rate_min = float(log_rate_min)
+        self.log_rate_max = float(log_rate_max)
+        self.alpha = float(alpha)
+        self.target_grid_min = max(float(target_grid_min), self.log_rate_min)
+        self.target_grid_max = min(float(target_grid_max), self.log_rate_max)
+        self.target_grid_size = int(target_grid_size)
+        self.sigreg_knots = int(sigreg_knots)
+        self.sigreg_num_proj = int(sigreg_num_proj)
+        self.goal_cost = str(goal_cost).lower()
+        self.planner_poisson_weight = float(planner_poisson_weight)
+        self.compact_loss_weight = float(compact_loss_weight)
+        if self.log_rate_min >= self.log_rate_max:
+            raise ValueError("log_rate_min must be less than log_rate_max")
+
+        channels = [in_channels, *hidden_channels]
+        blocks = []
+        strides = [4, 2, 2]
+        for idx, (cin, cout) in enumerate(zip(channels[:-1], channels[1:])):
+            blocks += [
+                nn.Conv2d(
+                    cin,
+                    cout,
+                    kernel_size=5 if idx == 0 else 3,
+                    stride=strides[idx],
+                    padding=2 if idx == 0 else 1,
+                ),
+                nn.GroupNorm(num_groups=min(8, cout), num_channels=cout),
+                nn.Softplus(beta=1.0),
+            ]
+        blocks += [nn.Conv2d(channels[-1], self.rate_channels, kernel_size=3, stride=2, padding=1)]
+        self.encoder = nn.Sequential(*blocks)
+
+        with torch.no_grad():
+            dummy = torch.zeros(1, in_channels, self.img_size, self.img_size)
+            rate_shape = self.encoder(dummy).shape[1:]
+        self.rate_shape = tuple(int(x) for x in rate_shape)
+        self.rate_dim = int(math.prod(self.rate_shape))
+
+        self.to_state = nn.Sequential(
+            nn.LayerNorm(self.rate_dim),
+            nn.Linear(self.rate_dim, self.state_dim),
+            nn.SiLU(),
+            nn.LayerNorm(self.state_dim),
+        )
+        self.state_to_rate = nn.Sequential(
+            nn.Linear(self.state_dim, 4 * self.state_dim),
+            nn.SiLU(),
+            nn.Linear(4 * self.state_dim, self.rate_dim),
+        )
+
+        action_dim = int(getattr(action_encoder, "emb_dim", self.state_dim))
+        self.transition = nn.GRU(
+            input_size=self.state_dim + action_dim,
+            hidden_size=self.state_dim,
+            batch_first=True,
+        )
+        self.sigreg_proj = nn.Linear(self.rate_dim, min(self.rate_dim, 512), bias=False)
+
+        r_grid = torch.linspace(
+            self.target_grid_min,
+            self.target_grid_max,
+            self.target_grid_size,
+            dtype=torch.float32,
+        )
+        lam_grid = self.lambda0 * torch.exp(r_grid)
+        k0_grid = lam_grid * r_grid - lam_grid + self.lambda0
+        logp = r_grid - self.alpha * k0_grid
+        probs = torch.softmax(logp, dim=0)
+        self.register_buffer("target_r_grid", r_grid)
+        self.register_buffer("target_r_probs", probs)
+        self.register_buffer("target_rate_mean", (probs * lam_grid).sum())
+        self.register_buffer("target_prior_kl_mean", (probs * k0_grid).sum())
+
+    def _clamp_log_rate(self, r):
+        return r.clamp(self.log_rate_min, self.log_rate_max)
+
+    def _rates(self, r):
+        return self.lambda0 * torch.exp(self._clamp_log_rate(r))
+
+    def _prior_kl_from_r(self, r):
+        r = self._clamp_log_rate(r)
+        lam = self._rates(r)
+        return lam * r - lam + self.lambda0
+
+    def _sample_target_r(self, shape, device, dtype):
+        probs = self.target_r_probs.to(device=device)
+        idx = torch.multinomial(probs, num_samples=math.prod(shape), replacement=True)
+        return self.target_r_grid.to(device=device, dtype=dtype)[idx].reshape(shape)
+
+    def encode(self, info):
+        pixels = info["pixels"].float()
+        b = pixels.size(0)
+        flat_pixels = rearrange(pixels, "b t c h w -> (b t) c h w")
+        r_map = self._clamp_log_rate(self.encoder(flat_pixels))
+        r_flat = r_map.flatten(1)
+        state = self.to_state(r_flat)
+        info["r_emb"] = rearrange(r_flat, "(b t) d -> b t d", b=b)
+        info["rate_emb"] = self._rates(info["r_emb"])
+        info["emb"] = rearrange(state, "(b t) d -> b t d", b=b)
+        if "action" in info:
+            info["act_emb"] = self.action_encoder(info["action"])
+        return info
+
+    def decode_state(self, state):
+        shape = state.shape
+        flat = state.reshape(-1, shape[-1])
+        r = self._clamp_log_rate(self.state_to_rate(flat))
+        return r.reshape(*shape[:-1], self.rate_dim)
+
+    def predict(self, emb, act_emb):
+        x = torch.cat([emb, act_emb], dim=-1)
+        out, _ = self.transition(x)
+        return out
+
+    def _anchor_loss(self, r_anchor):
+        target = self._sample_target_r(
+            r_anchor.shape,
+            device=r_anchor.device,
+            dtype=r_anchor.dtype,
+        )
+        r_proj = self.sigreg_proj(r_anchor)
+        target_proj = self.sigreg_proj(target)
+        return two_sample_sigreg(
+            r_proj,
+            target_proj,
+            knots=self.sigreg_knots,
+            num_proj=self.sigreg_num_proj,
+        )
+
+    def _diagnostics(self, z_anchor, r_anchor, r_pred, beta, compact_loss):
+        with torch.no_grad():
+            lam_anchor = self._rates(r_anchor.detach())
+            prior_kl = self._prior_kl_from_r(r_anchor.detach())
+            lam_pred = self._rates(r_pred.detach())
+            return {
+                "beta": z_anchor.new_tensor(float(beta)),
+                "alpha": z_anchor.new_tensor(self.alpha),
+                "lambda0": z_anchor.new_tensor(self.lambda0),
+                "compact_loss_weight": z_anchor.new_tensor(self.compact_loss_weight),
+                "compact_loss": compact_loss.detach(),
+                "effective_rank_z": effective_rank(z_anchor.detach()),
+                "z_mean": z_anchor.detach().mean(),
+                "z_std": z_anchor.detach().std(unbiased=False),
+                "r_mean": r_anchor.detach().mean(),
+                "r_std": r_anchor.detach().std(unbiased=False),
+                "r_at_min_frac": (r_anchor.detach() <= self.log_rate_min + 1e-6).float().mean(),
+                "r_at_max_frac": (r_anchor.detach() >= self.log_rate_max - 1e-6).float().mean(),
+                "rate_mean": lam_anchor.mean(),
+                "rate_std": lam_anchor.std(unbiased=False),
+                "rate_max_seen": lam_anchor.max(),
+                "pred_rate_mean": lam_pred.mean(),
+                "pred_rate_max": lam_pred.max(),
+                "prior_kl_mean": prior_kl.mean(),
+                "prior_kl_std": prior_kl.std(unbiased=False),
+                "target_rate_mean": self.target_rate_mean.to(z_anchor.device),
+                "target_prior_kl_mean": self.target_prior_kl_mean.to(z_anchor.device),
+            }
+
+    def compute_loss(self, batch, cfg):
+        if "action" in batch:
+            batch["action"] = torch.nan_to_num(batch["action"], 0.0)
+        output = self.encode(batch)
+        z = output["emb"]
+        r = output["r_emb"]
+        act_emb = output["act_emb"]
+        beta = cfg.loss.get("beta", 0.1)
+
+        ctx_z = z[:, :-1]
+        ctx_act = act_emb[:, :-1]
+        tgt_z = z[:, 1:].detach()
+        tgt_r = r[:, 1:].detach()
+        pred_z = self.predict(ctx_z, ctx_act)
+        pred_r = self.decode_state(pred_z)
+
+        pred_loss = poisson_kl_log_rates(tgt_r, pred_r, self.lambda0).mean()
+        compact_loss = (pred_z - tgt_z).pow(2).mean()
+        r_anchor = r.reshape(-1, r.shape[-1])
+        z_anchor = z.reshape(-1, z.shape[-1])
+        anchor_loss = self._anchor_loss(r_anchor)
+
+        output["pred_loss"] = pred_loss
+        output["compact_loss"] = compact_loss
+        output["anchor_loss"] = anchor_loss
+        output["reg_loss"] = anchor_loss
+        output["loss"] = pred_loss + self.compact_loss_weight * compact_loss + float(beta) * anchor_loss
+        if not torch.isfinite(output["loss"]):
+            raise FloatingPointError("non-finite ConvRSSMPoissonWM loss")
+        output.update(self._diagnostics(z_anchor, r_anchor, pred_r, beta, compact_loss))
+        return output
+
+    def rollout(self, info, action_sequence, history_size: int = 3):
+        assert "pixels" in info, "pixels not in info_dict"
+        H = info["pixels"].size(2)
+        B, S, T = action_sequence.shape[:3]
+        act_0, act_future = torch.split(action_sequence, [H, T - H], dim=2)
+        info["action"] = act_0
+        n_steps = T - H
+
+        init = {k: v[:, 0] for k, v in info.items() if torch.is_tensor(v)}
+        init = self.encode(init)
+        emb = init["emb"].unsqueeze(1).expand(B, S, -1, -1)
+        emb = rearrange(emb, "b s ... -> (b s) ...").clone()
+        act = rearrange(act_0, "b s ... -> (b s) ...")
+        act_future = rearrange(act_future, "b s ... -> (b s) ...")
+
+        HS = history_size
+        for t in range(n_steps):
+            act_emb = self.action_encoder(act)
+            pred = self.predict(emb[:, -HS:], act_emb[:, -HS:])[:, -1:]
+            emb = torch.cat([emb, pred], dim=1)
+            act = torch.cat([act, act_future[:, t : t + 1]], dim=1)
+
+        act_emb = self.action_encoder(act)
+        pred = self.predict(emb[:, -HS:], act_emb[:, -HS:])[:, -1:]
+        emb = torch.cat([emb, pred], dim=1)
+        info["predicted_emb"] = rearrange(emb, "(b s) ... -> b s ...", b=B, s=S)
+        return info
+
+    def criterion(self, info_dict):
+        pred_z = info_dict["predicted_emb"][..., -1, :]
+        goal_z = info_dict["goal_emb"][..., -1:, :].expand_as(
+            info_dict["predicted_emb"]
+        )[..., -1, :].detach()
+        compact_cost = (pred_z - goal_z).pow(2).sum(dim=-1)
+        if self.goal_cost in {"compact_mse", "state_mse", "mse"}:
+            return compact_cost
+
+        pred_r = self.decode_state(pred_z)
+        goal_r = info_dict["goal_r_emb"][..., -1, :].detach()
+        poisson_cost = poisson_kl_log_rates(goal_r, pred_r, self.lambda0).mean(dim=-1)
+        if self.goal_cost in {"poisson_kl", "kl"}:
+            return poisson_cost
+        if self.goal_cost == "hybrid":
+            return compact_cost + self.planner_poisson_weight * poisson_cost
+        return compact_cost
+
+    def get_cost(self, info_dict, action_candidates):
+        device = next(self.parameters()).device
+        for k in list(info_dict.keys()):
+            if torch.is_tensor(info_dict[k]):
+                info_dict[k] = info_dict[k].to(device)
+
+        goal = {k: v[:, 0] for k, v in info_dict.items() if torch.is_tensor(v)}
+        goal["pixels"] = goal["goal"]
+        for k in list(goal.keys()):
+            if k.startswith("goal_"):
+                goal[k[len("goal_") :]] = goal.pop(k)
+        goal.pop("action", None)
+        goal = self.encode(goal)
+        info_dict["goal_emb"] = goal["emb"]
+        info_dict["goal_r_emb"] = goal["r_emb"]
+        info_dict = self.rollout(info_dict, action_candidates)
+        return self.criterion(info_dict)
