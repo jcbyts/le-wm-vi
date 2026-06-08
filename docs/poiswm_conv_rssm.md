@@ -21,7 +21,9 @@ L = KL(Pois(lambda_t) || Pois(lambda_hat_t))
 
 The transition loss is the exact Poisson KL in log-rate coordinates. The SIGReg
 anchor still targets the maximum-entropy log-rate distribution induced by the
-Poisson prior-KL budget, including the log-rate Jacobian.
+Poisson prior-KL budget, including the log-rate Jacobian. The high-dimensional
+anchor is sketched with a fixed random projection buffer; it is not trainable,
+so the model cannot satisfy the anchor by changing the measurement map.
 
 ## Architecture
 

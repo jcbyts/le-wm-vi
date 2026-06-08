@@ -675,7 +675,10 @@ class ConvRSSMPoissonWM(nn.Module):
             hidden_size=self.state_dim,
             batch_first=True,
         )
-        self.sigreg_proj = nn.Linear(self.rate_dim, min(self.rate_dim, 512), bias=False)
+        sigreg_dim = min(self.rate_dim, 512)
+        sigreg_basis = torch.randn(self.rate_dim, sigreg_dim)
+        sigreg_basis = sigreg_basis / sigreg_basis.norm(p=2, dim=0, keepdim=True).clamp_min(1e-8)
+        self.register_buffer("sigreg_basis", sigreg_basis)
 
         r_grid = torch.linspace(
             self.target_grid_min,
@@ -739,8 +742,9 @@ class ConvRSSMPoissonWM(nn.Module):
             device=r_anchor.device,
             dtype=r_anchor.dtype,
         )
-        r_proj = self.sigreg_proj(r_anchor)
-        target_proj = self.sigreg_proj(target)
+        basis = self.sigreg_basis.to(device=r_anchor.device, dtype=r_anchor.dtype)
+        r_proj = r_anchor @ basis
+        target_proj = target @ basis
         return two_sample_sigreg(
             r_proj,
             target_proj,
