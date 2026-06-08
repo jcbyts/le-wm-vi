@@ -53,3 +53,12 @@ one-epoch two-batch training pass with W&B enabled. Initial diagnostics showed:
 
 The overnight sweep should primarily test whether this architecture fixes the
 planning instability seen with ViT-based Poisson latents.
+
+## Exponential Anchor Control
+
+The same Conv RSSM architecture can also use an exponential rate anchor by
+setting `model.anchor_type=exponential`. This keeps the exact high-dimensional
+Poisson transition KL, but replaces the metabolic target distribution with the
+older exponential rate moment constraint at `model.target_rate=1.0`. The compact
+state remains the planning state; prediction is still decoded back to the
+high-dimensional Poisson rate code.

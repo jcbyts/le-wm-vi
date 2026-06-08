@@ -10,6 +10,7 @@ from torch import nn
 from module import (
     SIGReg,
     effective_rank,
+    exponential_sigreg,
     poisson_kl_rates,
     poisson_kl_log_rates,
     sample_capacity_rates,
@@ -609,6 +610,8 @@ class ConvRSSMPoissonWM(nn.Module):
         target_grid_size=65536,
         sigreg_knots=17,
         sigreg_num_proj=128,
+        anchor_type="metabolic",
+        target_rate=1.0,
         goal_cost="compact_mse",
         planner_poisson_weight=0.0,
         compact_loss_weight=0.1,
@@ -627,6 +630,8 @@ class ConvRSSMPoissonWM(nn.Module):
         self.target_grid_size = int(target_grid_size)
         self.sigreg_knots = int(sigreg_knots)
         self.sigreg_num_proj = int(sigreg_num_proj)
+        self.anchor_type = str(anchor_type).lower()
+        self.target_rate = float(target_rate)
         self.goal_cost = str(goal_cost).lower()
         self.planner_poisson_weight = float(planner_poisson_weight)
         self.compact_loss_weight = float(compact_loss_weight)
@@ -737,6 +742,10 @@ class ConvRSSMPoissonWM(nn.Module):
         return out
 
     def _anchor_loss(self, r_anchor):
+        if self.anchor_type in {"exponential", "geometric", "exp"}:
+            return exponential_sigreg(r_anchor, target_rate=self.target_rate)
+        if self.anchor_type not in {"metabolic", "metabolic_sigreg", "poisson"}:
+            raise ValueError(f"unknown ConvRSSMPoissonWM anchor_type: {self.anchor_type}")
         target = self._sample_target_r(
             r_anchor.shape,
             device=r_anchor.device,
@@ -760,6 +769,7 @@ class ConvRSSMPoissonWM(nn.Module):
             return {
                 "beta": z_anchor.new_tensor(float(beta)),
                 "alpha": z_anchor.new_tensor(self.alpha),
+                "target_rate": z_anchor.new_tensor(self.target_rate),
                 "lambda0": z_anchor.new_tensor(self.lambda0),
                 "compact_loss_weight": z_anchor.new_tensor(self.compact_loss_weight),
                 "compact_loss": compact_loss.detach(),

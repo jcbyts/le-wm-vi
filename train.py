@@ -80,6 +80,7 @@ def poiswm_forward(self, batch, stage, cfg):
         "fisher_weight_mean",
         "fisher_weight_max",
         "alpha",
+        "target_rate",
         "lambda0",
         "log_rate_min",
         "log_rate_max",

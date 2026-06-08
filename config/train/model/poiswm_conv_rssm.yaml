@@ -19,6 +19,8 @@ model:
   target_grid_size: 65536
   sigreg_knots: 17
   sigreg_num_proj: 128
+  anchor_type: metabolic
+  target_rate: 1.0
   goal_cost: compact_mse
   planner_poisson_weight: 0.0
   compact_loss_weight: 0.1
