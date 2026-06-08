@@ -1,15 +1,19 @@
 # @package _global_
 forward_type: poiswm
-output_model_name: poiswm
+output_model_name: poiswm_metabolic_sigreg
 
 model:
-  _target_: jepa.PoisWM
-  target_rate: 1.0
-  A_over_mu: 8.0
-  capacity_grid_size: 512
+  _target_: jepa.MetabolicSigRegPoisWM
+  lambda0: 1.0
+  alpha: 1.0
+  log_rate_min: -12.0
+  log_rate_max: 5.0
+  target_grid_min: -12.0
+  target_grid_max: 5.0
+  target_grid_size: 65536
   sigreg_knots: 17
   sigreg_num_proj: 1024
-  goal_cost: sym_kl
+  goal_cost: poisson_kl
 
   encoder:
     _target_: stable_pretraining.backbone.utils.vit_hf
@@ -57,3 +61,8 @@ model:
 
 loss:
   beta: 1.0
+  sigreg:
+    weight: 0.09
+    kwargs:
+      knots: 17
+      num_proj: 1024

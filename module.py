@@ -1,3 +1,5 @@
+import math
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -62,6 +64,186 @@ def exponential_sigreg(u, target_rate=1.0):
         cov_loss = off_diag.pow(2).sum() / D
 
     return mean_loss + std_loss + cov_loss
+
+
+def poisson_kl_rates(lam_q, lam_p, eps: float = 1e-8):
+    """Elementwise KL(Pois(lam_q) || Pois(lam_p)) for positive rates."""
+    lam_q = lam_q.clamp_min(eps)
+    lam_p = lam_p.clamp_min(eps)
+    return lam_q * (torch.log(lam_q) - torch.log(lam_p)) - lam_q + lam_p
+
+
+def poisson_kl_log_rates(r_q, r_p, lambda0: float = 1.0):
+    """Elementwise KL(Pois(lambda0*exp(r_q)) || Pois(lambda0*exp(r_p))).
+
+    This is algebraically identical to ``poisson_kl_rates`` after converting
+    residual log-rates to rates, but avoids rate ratios/logs.
+    """
+    lam_q = float(lambda0) * torch.exp(r_q)
+    lam_p = float(lambda0) * torch.exp(r_p)
+    return lam_q * (r_q - r_p) - lam_q + lam_p
+
+
+def two_sample_sigreg(x, target, knots: int = 17, num_proj: int = 1024):
+    """SIGReg-style random-projection characteristic-function matching."""
+    if x.shape != target.shape:
+        raise ValueError(f"two_sample_sigreg shape mismatch: {x.shape} vs {target.shape}")
+    if x.ndim != 2:
+        raise ValueError(f"two_sample_sigreg expects [B, D], got {x.shape}")
+
+    B, D = x.shape
+    device = x.device
+    dtype = x.dtype
+    t = torch.linspace(0, 3, knots, device=device, dtype=dtype)
+    dt = 3 / (knots - 1)
+    weights = torch.full((knots,), 2 * dt, device=device, dtype=dtype)
+    weights[[0, -1]] = dt
+    weights = weights * torch.exp(-t.square() / 2.0)
+
+    proj = torch.randn(D, num_proj, device=device, dtype=dtype)
+    proj = proj / proj.norm(p=2, dim=0, keepdim=True).clamp_min(1e-8)
+
+    x_t = (x @ proj).unsqueeze(-1) * t
+    target_t = (target @ proj).unsqueeze(-1) * t
+    err = (
+        (x_t.cos().mean(dim=0) - target_t.cos().mean(dim=0)).square()
+        + (x_t.sin().mean(dim=0) - target_t.sin().mean(dim=0)).square()
+    )
+    return ((err @ weights) * B).mean()
+
+
+def sample_capacity_rates(rates, pi, shape, device, dtype):
+    rates_t = torch.as_tensor(rates, device=device, dtype=dtype)
+    pi_t = torch.as_tensor(pi, device=device, dtype=dtype)
+    pi_t = pi_t / pi_t.sum().clamp_min(1e-12)
+    idx = torch.multinomial(pi_t, num_samples=shape[0] * shape[1], replacement=True)
+    return rates_t[idx].reshape(shape)
+
+
+def scalar_poisson_mi(lam, nmax: int, eps: float = 1e-8):
+    """Deterministic per-coordinate scalar Poisson-channel MI diagnostic."""
+    B, _D = lam.shape
+    with torch.amp.autocast(device_type=lam.device.type, enabled=False):
+        lam = lam.float().clamp_min(eps)
+        n = torch.arange(nmax + 1, device=lam.device, dtype=lam.dtype)
+        log_fact = torch.lgamma(n + 1.0)
+        log_lam = torch.log(lam)
+        logW = (
+            n.view(1, 1, -1) * log_lam.unsqueeze(-1)
+            - lam.unsqueeze(-1)
+            - log_fact.view(1, 1, -1)
+        )
+        logW = logW - torch.logsumexp(logW, dim=-1, keepdim=True)
+        W = torch.exp(logW)
+        logq = torch.logsumexp(logW, dim=0) - math.log(B)
+        return (W * (logW - logq.unsqueeze(0))).sum(dim=-1).mean(dim=0)
+
+
+def effective_rank(x, eps: float = 1e-8):
+    """Entropy effective rank of centered features, computed in float32."""
+    if x.shape[0] <= 1 or x.shape[1] <= 1:
+        return x.new_tensor(1.0)
+    with torch.amp.autocast(device_type=x.device.type, enabled=False):
+        y = x.float() - x.float().mean(dim=0, keepdim=True)
+        cov = (y.T @ y) / max(1, y.shape[0] - 1)
+        eigvals = torch.linalg.eigvalsh(cov).clamp_min(0.0)
+        probs = eigvals / eigvals.sum().clamp_min(eps)
+        entropy = -(probs * torch.log(probs.clamp_min(eps))).sum()
+        return torch.exp(entropy)
+
+
+def make_rate_grid(mu: float, A: float, K: int = 512):
+    import numpy as np
+
+    eps = max(1e-6, 1e-4 * mu)
+    grid = np.concatenate([
+        np.array([0.0]),
+        np.geomspace(eps, A, K // 2),
+        np.linspace(0.0, A, K // 2),
+    ])
+    return np.unique(np.sort(grid))
+
+
+def poisson_channel_matrix(rates, nmax: int):
+    import numpy as np
+    from scipy.special import gammaln
+
+    rates = np.asarray(rates, dtype=np.float64)
+    n = np.arange(nmax + 1, dtype=np.float64)
+    W = np.zeros((len(rates), nmax + 1), dtype=np.float64)
+
+    positive = rates > 0
+    r = rates[positive]
+    logW = (
+        n[None, :] * np.log(r[:, None])
+        - r[:, None]
+        - gammaln(n[None, :] + 1.0)
+    )
+    W[positive] = np.exp(logW)
+    W[~positive, 0] = 1.0
+
+    tail = np.clip(1.0 - W.sum(axis=1, keepdims=True), 0.0, 1.0)
+    W = np.concatenate([W, tail], axis=1)
+    W = np.clip(W, 1e-300, 1.0)
+    return W / W.sum(axis=1, keepdims=True)
+
+
+def blahut_arimoto_cost(W, cost, beta: float, n_iter: int = 5000, tol: float = 1e-12):
+    import numpy as np
+    from scipy.special import logsumexp
+
+    K = W.shape[0]
+    pi = np.ones(K, dtype=np.float64) / K
+    logW = np.log(W)
+
+    for _ in range(n_iter):
+        q = pi @ W
+        D = np.sum(W * (logW - np.log(q)[None, :]), axis=1)
+        logits = np.log(pi) + D - beta * cost
+        logits = logits - logsumexp(logits)
+        pi_new = np.exp(logits)
+        if np.max(np.abs(pi_new - pi)) < tol:
+            pi = pi_new
+            break
+        pi = pi_new
+
+    q = pi @ W
+    I = np.sum(pi[:, None] * W * (logW - np.log(q)[None, :]))
+    mean_cost = np.sum(pi * cost)
+    return pi, I, mean_cost
+
+
+def solve_poisson_capacity_prior(mu: float, A: float, K: int = 512):
+    import numpy as np
+
+    rates = make_rate_grid(mu, A, K=K)
+    nmax = int(np.ceil(A + 10.0 * np.sqrt(A + 1.0) + 20.0))
+    W = poisson_channel_matrix(rates, nmax)
+
+    pi0, C0, m0 = blahut_arimoto_cost(W, rates, beta=0.0)
+    if m0 <= mu:
+        return rates, pi0, C0, nmax
+
+    lo, hi = 0.0, 1.0
+    while True:
+        _, _, m_hi = blahut_arimoto_cost(W, rates, beta=hi, n_iter=1500)
+        if m_hi <= mu:
+            break
+        hi *= 2.0
+
+    best = None
+    for _ in range(50):
+        mid = 0.5 * (lo + hi)
+        pi, C, m = blahut_arimoto_cost(W, rates, beta=mid, n_iter=2500)
+        best = (pi, C, m, mid)
+        if m > mu:
+            lo = mid
+        else:
+            hi = mid
+
+    pi, _C, _m, beta = best
+    pi, C, _m = blahut_arimoto_cost(W, rates, beta=beta, n_iter=8000)
+    return rates, pi, C, nmax
     
 class FeedForward(nn.Module):
     """FeedForward network used in Transformers"""

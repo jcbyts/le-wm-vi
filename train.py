@@ -15,7 +15,7 @@ from omegaconf import OmegaConf, open_dict
 
 import planning
 from model import vijepa_forward
-from module import SIGReg, exponential_sigreg
+from module import SIGReg
 from monitor import BehaviorEvalCallback, FondVizCallback
 from utils import get_column_normalizer, get_img_preprocessor, SaveCkptCallback
 
@@ -52,34 +52,55 @@ def lejepa_forward(self, batch, stage, cfg):
 
 
 def poiswm_forward(self, batch, stage, cfg):
-    """LeWM architecture with exact Poisson KL and Exponential SIGReg."""
+    """LeWM architecture with exact Poisson KL and Capacity-SIGReg."""
+    output = self.model.compute_loss(batch, cfg)
 
-    ctx_len = cfg.history_size
-    n_preds = cfg.num_preds
-    beta = cfg.loss.get("beta", 1.0)
-
-    # Replace NaN values with 0 (occurs at sequence boundaries)
-    batch["action"] = torch.nan_to_num(batch["action"], 0.0)
-
-    output = self.model.encode(batch)
-
-    emb = output["emb"]  # (B, T, D), interpreted as Poisson log-rates
-    act_emb = output["act_emb"]
-
-    ctx_emb = emb[:, :ctx_len]
-    ctx_act = act_emb[:, :ctx_len]
-
-    tgt_emb = emb[:, n_preds:].detach()
-    pred_emb = self.model.predict(ctx_emb, ctx_act)
-
-    output["pred_loss"] = self.model._exact_poisson_kl(tgt_emb, pred_emb)
-    output["reg_loss"] = exponential_sigreg(
-        ctx_emb.reshape(-1, ctx_emb.shape[-1]),
-        target_rate=self.model.target_rate,
-    )
-    output["loss"] = output["pred_loss"] + beta * output["reg_loss"]
-
-    losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
+    log_keys = {
+        "loss",
+        "pred_loss",
+        "anchor_loss",
+        "reg_loss",
+        "beta",
+        "A_over_mu",
+        "mean_rate_mean",
+        "mean_rate_std",
+        "rate_min_seen",
+        "rate_max_seen",
+        "effective_rank",
+        "poisson_mi_mean",
+        "poisson_mi_min",
+        "poisson_mi_max",
+        "capacity_target",
+        "tau",
+        "effective_rank_u",
+        "u_mean",
+        "u_std",
+        "rate_mean",
+        "rate_std",
+        "fisher_weight_mean",
+        "fisher_weight_max",
+        "alpha",
+        "lambda0",
+        "log_rate_min",
+        "log_rate_max",
+        "effective_rank_r",
+        "r_mean",
+        "r_std",
+        "r_at_min_frac",
+        "r_at_max_frac",
+        "prior_kl_mean",
+        "prior_kl_std",
+        "pred_rate_mean",
+        "pred_rate_max",
+        "target_rate_mean",
+        "target_rate_std",
+        "target_prior_kl_mean",
+    }
+    losses_dict = {
+        f"{stage}/{k}": v.detach()
+        for k, v in output.items()
+        if k in log_keys and torch.is_tensor(v)
+    }
     self.log_dict(losses_dict, on_step=True, sync_dist=True)
     return output
 
