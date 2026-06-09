@@ -321,19 +321,24 @@ class PoissonHead(LatentHead):
     family = "poisson"
     param_mult = 1
 
+    def __init__(self, tau=0.2, log_lo=LOG_LO, log_hi=LOG_HI):
+        super().__init__(tau=tau)
+        self.log_lo = float(log_lo)
+        self.log_hi = float(log_hi)
+
     def sample(self, param):
-        return PoissonEAT(param, tau=self.tau).rsample(hard=False)
+        return PoissonEAT(param.clamp(self.log_lo, self.log_hi), tau=self.tau).rsample(hard=False)
 
     def clamp_param(self, param):
-        return param.clamp(LOG_LO, LOG_HI)
+        return param.clamp(self.log_lo, self.log_hi)
 
     @torch.no_grad()
     def param_stats(self, param, eps=1e-3):
-        lr = param.clamp(LOG_LO, LOG_HI)
+        lr = param.clamp(self.log_lo, self.log_hi)
         rate = lr.exp()
         flat = rate.flatten().float()
-        hi = (lr >= LOG_HI - eps).float().mean().item()
-        lo = (lr <= LOG_LO + eps).float().mean().item()
+        hi = (lr >= self.log_hi - eps).float().mean().item()
+        lo = (lr <= self.log_lo + eps).float().mean().item()
         return {"lograte_mean": lr.mean().item(), "rate_mean": rate.mean().item(),
                 "rate_p95": torch.quantile(flat, 0.95).item(),
                 "rate_p99": torch.quantile(flat, 0.99).item(),
@@ -342,9 +347,11 @@ class PoissonHead(LatentHead):
 
     def to_code(self, param):
         # deterministic code = the rate itself (clamped), differentiable in u
-        return torch.exp(param.clamp(LOG_LO, LOG_HI))
+        return torch.exp(param.clamp(self.log_lo, self.log_hi))
 
     def pred_term(self, post, prior, loss, detach_metric=False):
+        post = post.clamp(self.log_lo, self.log_hi)
+        prior = prior.clamp(self.log_lo, self.log_hi)
         if loss == "exact_kl":
             return poisson_kl(post, prior, detach_metric=detach_metric).sum(-1).mean()
         if loss == "quadratic_fisher":
@@ -352,19 +359,27 @@ class PoissonHead(LatentHead):
         raise ValueError(f"poisson head: unknown loss {loss}")
 
     def kl_exact(self, post, prior):
+        post = post.clamp(self.log_lo, self.log_hi)
+        prior = prior.clamp(self.log_lo, self.log_hi)
         return poisson_kl(post, prior).sum(-1).mean()
 
     def kl_perexample(self, post, prior):
+        post = post.clamp(self.log_lo, self.log_hi)
+        prior = prior.clamp(self.log_lo, self.log_hi)
         return poisson_kl(post, prior).sum(-1)
 
     def kl_energy(self, post, prior):
+        post = post.clamp(self.log_lo, self.log_hi)
+        prior = prior.clamp(self.log_lo, self.log_hi)
         return poisson_kl(post, prior).sum()
 
     def fisher_quad(self, post, prior):
+        post = post.clamp(self.log_lo, self.log_hi)
+        prior = prior.clamp(self.log_lo, self.log_hi)
         return poisson_fisher_quad(post, prior).sum(-1).mean()
 
     def fisher_metric(self, param):
-        return torch.exp(param.clamp(LOG_LO, LOG_HI))
+        return torch.exp(param.clamp(self.log_lo, self.log_hi))
 
 
 _HEADS = {
@@ -374,7 +389,14 @@ _HEADS = {
 }
 
 
-def make_head(family, tau=0.2, full_fisher=False, fixed_unit_variance=False):
+def make_head(
+    family,
+    tau=0.2,
+    full_fisher=False,
+    fixed_unit_variance=False,
+    poisson_log_lo=LOG_LO,
+    poisson_log_hi=LOG_HI,
+):
     if family not in _HEADS:
         raise ValueError(f"unknown latent family {family!r}; choose from {list(_HEADS)}")
     if family == "gaussian":
@@ -382,6 +404,8 @@ def make_head(family, tau=0.2, full_fisher=False, fixed_unit_variance=False):
             tau=tau, full_fisher=full_fisher,
             fixed_unit_variance=fixed_unit_variance,
         )
+    if family == "poisson":
+        return PoissonHead(tau=tau, log_lo=poisson_log_lo, log_hi=poisson_log_hi)
     return _HEADS[family](tau=tau)
 
 
