@@ -101,6 +101,13 @@ def poiswm_forward(self, batch, stage, cfg):
         "effective_rank_z",
         "z_mean",
         "z_std",
+        "code_loss",
+        "effective_rank_code",
+        "code_mean",
+        "code_std",
+        "pred_code_mean",
+        "pred_code_std",
+        "pred_code_max_abs",
     }
     losses_dict = {
         f"{stage}/{k}": v.detach()

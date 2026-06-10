@@ -17,15 +17,15 @@ import torch
 from torchvision.transforms import v2 as transforms
 
 
-def image_transform(img_size: int):
-    return transforms.Compose(
-        [
-            transforms.ToImage(),
-            transforms.ToDtype(torch.float32, scale=True),
-            transforms.Normalize(**spt.data.dataset_stats.ImageNet),
-            transforms.Resize(size=img_size),
-        ]
-    )
+def image_transform(img_size: int, normalize: bool = True):
+    steps = [
+        transforms.ToImage(),
+        transforms.ToDtype(torch.float32, scale=True),
+    ]
+    if normalize:
+        steps.append(transforms.Normalize(**spt.data.dataset_stats.ImageNet))
+    steps.append(transforms.Resize(size=img_size))
+    return transforms.Compose(steps)
 
 
 def load_rows(dataset, indices):
@@ -37,9 +37,9 @@ def load_rows(dataset, indices):
 
 
 @torch.no_grad()
-def encode_dataset(model, dataset, indices, *, batch_size, img_size, device):
-    tfm = image_transform(img_size)
-    xs = []
+def encode_dataset(model, dataset, indices, *, batch_size, img_size, device, normalize_img):
+    tfm = image_transform(img_size, normalize=normalize_img)
+    xs = {}
     ys = {"state": [], "proprio": []}
 
     model.eval().to(device)
@@ -52,12 +52,14 @@ def encode_dataset(model, dataset, indices, *, batch_size, img_size, device):
         b, t = pixels.shape[:2]
         pixels = tfm(pixels.reshape(b * t, *pixels.shape[2:])).reshape(b, t, 3, img_size, img_size)
         out = model.encode({"pixels": pixels.to(device)})
-        emb = out["emb"].detach().float().cpu()
-        xs.append(emb.reshape(b * t, -1))
+        for key in ("emb", "r_emb", "rate_emb", "code_emb"):
+            if key in out:
+                value = out[key].detach().float().cpu().reshape(b * t, -1)
+                xs.setdefault(key, []).append(value)
         for key, value in targets.items():
             ys[key].append(value.reshape(b * t, -1))
 
-    x = torch.cat(xs, dim=0)
+    x = {key: torch.cat(parts, dim=0) for key, parts in xs.items()}
     y = {key: torch.cat(parts, dim=0) for key, parts in ys.items()}
     return x, y
 
@@ -120,6 +122,7 @@ def main():
     parser.add_argument("--frameskip", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--img-size", type=int, default=224)
+    parser.add_argument("--normalize-img", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--ridge", type=float, default=1e-2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
@@ -142,25 +145,53 @@ def main():
     test_idx = np.sort(indices[split:])
 
     model = swm.wm.utils.load_pretrained(args.policy)
-    x_train_r, y_train = encode_dataset(
-        model, dataset, train_idx, batch_size=args.batch_size, img_size=args.img_size, device=args.device
+    x_train, y_train = encode_dataset(
+        model,
+        dataset,
+        train_idx,
+        batch_size=args.batch_size,
+        img_size=args.img_size,
+        device=args.device,
+        normalize_img=args.normalize_img,
     )
-    x_test_r, y_test = encode_dataset(
-        model, dataset, test_idx, batch_size=args.batch_size, img_size=args.img_size, device=args.device
+    x_test, y_test = encode_dataset(
+        model,
+        dataset,
+        test_idx,
+        batch_size=args.batch_size,
+        img_size=args.img_size,
+        device=args.device,
+        normalize_img=args.normalize_img,
     )
 
-    reps = {
-        "log_rate": (x_train_r, x_test_r),
-        "rate": (torch.exp(x_train_r.clamp(-12.0, 5.0)), torch.exp(x_test_r.clamp(-12.0, 5.0))),
-    }
+    reps = {}
+    if "emb" in x_train:
+        reps["emb"] = (x_train["emb"], x_test["emb"])
+    if "r_emb" in x_train:
+        reps["log_rate"] = (x_train["r_emb"], x_test["r_emb"])
+        reps["rate"] = (
+            torch.exp(x_train["r_emb"].clamp(-12.0, 5.0)),
+            torch.exp(x_test["r_emb"].clamp(-12.0, 5.0)),
+        )
+    if "code_emb" in x_train:
+        reps["code"] = (x_train["code_emb"], x_test["code_emb"])
+    elif "rate_emb" in x_train:
+        reps["rate"] = (x_train["rate_emb"], x_test["rate_emb"])
+    elif "emb" in x_train:
+        reps["rate_like_exp_emb"] = (
+            torch.exp(x_train["emb"].clamp(-12.0, 5.0)),
+            torch.exp(x_test["emb"].clamp(-12.0, 5.0)),
+        )
+    first_rep = next(iter(reps.values()))
     results = {
         "name": args.name,
         "policy": args.policy,
-        "num_train_vectors": int(x_train_r.shape[0]),
-        "num_test_vectors": int(x_test_r.shape[0]),
+        "num_train_vectors": int(first_rep[0].shape[0]),
+        "num_test_vectors": int(first_rep[1].shape[0]),
         "num_steps": args.num_steps,
         "frameskip": args.frameskip,
         "ridge": args.ridge,
+        "normalize_img": args.normalize_img,
         "representations": {},
     }
     for rep_name, (xtr, xte) in reps.items():

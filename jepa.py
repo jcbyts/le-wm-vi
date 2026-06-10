@@ -886,3 +886,242 @@ class ConvRSSMPoissonWM(nn.Module):
         info_dict["goal_r_emb"] = goal["r_emb"]
         info_dict = self.rollout(info_dict, action_candidates)
         return self.criterion(info_dict)
+
+class ConvRSSMGaussianWM(nn.Module):
+    """Conv Gaussian perceptual code with compact recurrent dynamics.
+
+    This is the Gaussian control baseline for ``ConvRSSMPoissonWM``. It keeps
+    the same compact RSSM controller/planner, but replaces nonnegative rates
+    and Poisson KL with signed Gaussian codes, MSE prediction, and SIGReg.
+    """
+
+    def __init__(
+        self,
+        action_encoder,
+        img_size=224,
+        in_channels=3,
+        code_channels=64,
+        state_dim=128,
+        hidden_channels=(32, 64, 128),
+        sigreg_knots=17,
+        sigreg_num_proj=1024,
+        prediction_space="code",
+        anchor_space="prediction",
+        goal_cost="compact_mse",
+        planner_code_weight=0.0,
+        compact_loss_weight=0.1,
+    ):
+        super().__init__()
+        self.action_encoder = action_encoder
+        self.img_size = int(img_size)
+        self.code_channels = int(code_channels)
+        self.state_dim = int(state_dim)
+        self.prediction_space = str(prediction_space).lower()
+        self.anchor_space = str(anchor_space).lower()
+        if self.anchor_space == "prediction":
+            self.anchor_space = self.prediction_space
+        self.goal_cost = str(goal_cost).lower()
+        self.planner_code_weight = float(planner_code_weight)
+        self.compact_loss_weight = float(compact_loss_weight)
+
+        channels = [in_channels, *hidden_channels]
+        blocks = []
+        strides = [4, 2, 2]
+        for idx, (cin, cout) in enumerate(zip(channels[:-1], channels[1:])):
+            blocks += [
+                nn.Conv2d(
+                    cin,
+                    cout,
+                    kernel_size=5 if idx == 0 else 3,
+                    stride=strides[idx],
+                    padding=2 if idx == 0 else 1,
+                ),
+                nn.GroupNorm(num_groups=min(8, cout), num_channels=cout),
+                nn.SiLU(),
+            ]
+        blocks += [nn.Conv2d(channels[-1], self.code_channels, kernel_size=3, stride=2, padding=1)]
+        self.encoder = nn.Sequential(*blocks)
+
+        with torch.no_grad():
+            dummy = torch.zeros(1, in_channels, self.img_size, self.img_size)
+            code_shape = self.encoder(dummy).shape[1:]
+        self.code_shape = tuple(int(x) for x in code_shape)
+        self.code_dim = int(math.prod(self.code_shape))
+
+        self.to_state = nn.Sequential(
+            nn.LayerNorm(self.code_dim),
+            nn.Linear(self.code_dim, self.state_dim),
+            nn.SiLU(),
+            nn.LayerNorm(self.state_dim),
+        )
+        self.state_to_code = nn.Sequential(
+            nn.Linear(self.state_dim, 4 * self.state_dim),
+            nn.SiLU(),
+            nn.Linear(4 * self.state_dim, self.code_dim),
+        )
+
+        action_dim = int(getattr(action_encoder, "emb_dim", self.state_dim))
+        self.transition = nn.GRU(
+            input_size=self.state_dim + action_dim,
+            hidden_size=self.state_dim,
+            batch_first=True,
+        )
+        self.sigreg = SIGReg(knots=sigreg_knots, num_proj=sigreg_num_proj)
+
+    def encode(self, info):
+        pixels = info["pixels"].float()
+        b = pixels.size(0)
+        flat_pixels = rearrange(pixels, "b t c h w -> (b t) c h w")
+        code_map = self.encoder(flat_pixels)
+        code_flat = code_map.flatten(1)
+        state = self.to_state(code_flat)
+        info["code_emb"] = rearrange(code_flat, "(b t) d -> b t d", b=b)
+        info["emb"] = rearrange(state, "(b t) d -> b t d", b=b)
+        if "action" in info:
+            info["act_emb"] = self.action_encoder(info["action"])
+        return info
+
+    def decode_state(self, state):
+        shape = state.shape
+        flat = state.reshape(-1, shape[-1])
+        code = self.state_to_code(flat)
+        return code.reshape(*shape[:-1], self.code_dim)
+
+    def predict(self, emb, act_emb):
+        x = torch.cat([emb, act_emb], dim=-1)
+        out, _ = self.transition(x)
+        return out
+
+    def _anchor_loss(self, z_anchor, code_anchor):
+        if self.anchor_space in {"state", "compact", "z", "emb"}:
+            return self.sigreg(z_anchor.unsqueeze(0))
+        if self.anchor_space in {"code", "high_d", "highd"}:
+            return self.sigreg(code_anchor.unsqueeze(0))
+        raise ValueError(f"unknown ConvRSSMGaussianWM anchor_space: {self.anchor_space}")
+
+    def _prediction_loss(self, pred_z, tgt_z, tgt_code):
+        compact_loss = (pred_z - tgt_z).pow(2).mean()
+        pred_code = self.decode_state(pred_z)
+        code_loss = (pred_code - tgt_code).pow(2).mean()
+        if self.prediction_space in {"state", "compact", "z", "emb"}:
+            return compact_loss, compact_loss, code_loss, pred_code
+        if self.prediction_space in {"code", "high_d", "highd"}:
+            return code_loss, compact_loss, code_loss, pred_code
+        raise ValueError(f"unknown ConvRSSMGaussianWM prediction_space: {self.prediction_space}")
+
+    def _diagnostics(self, z_anchor, code_anchor, pred_code, beta, compact_loss, code_loss):
+        with torch.no_grad():
+            return {
+                "beta": z_anchor.new_tensor(float(beta)),
+                "compact_loss_weight": z_anchor.new_tensor(self.compact_loss_weight),
+                "compact_loss": compact_loss.detach(),
+                "code_loss": code_loss.detach(),
+                "effective_rank_z": effective_rank(z_anchor.detach()),
+                "z_mean": z_anchor.detach().mean(),
+                "z_std": z_anchor.detach().std(unbiased=False),
+                "effective_rank_code": effective_rank(code_anchor.detach()),
+                "code_mean": code_anchor.detach().mean(),
+                "code_std": code_anchor.detach().std(unbiased=False),
+                "pred_code_mean": pred_code.detach().mean(),
+                "pred_code_std": pred_code.detach().std(unbiased=False),
+                "pred_code_max_abs": pred_code.detach().abs().max(),
+            }
+
+    def compute_loss(self, batch, cfg):
+        if "action" in batch:
+            batch["action"] = torch.nan_to_num(batch["action"], 0.0)
+        output = self.encode(batch)
+        z = output["emb"]
+        code = output["code_emb"]
+        act_emb = output["act_emb"]
+        beta = cfg.loss.get("beta", 0.1)
+
+        ctx_z = z[:, :-1]
+        ctx_act = act_emb[:, :-1]
+        tgt_z = z[:, 1:].detach()
+        tgt_code = code[:, 1:].detach()
+        pred_z = self.predict(ctx_z, ctx_act)
+        pred_loss, compact_loss, code_loss, pred_code = self._prediction_loss(pred_z, tgt_z, tgt_code)
+
+        z_anchor = z.reshape(-1, z.shape[-1])
+        code_anchor = code.reshape(-1, code.shape[-1])
+        anchor_loss = self._anchor_loss(z_anchor, code_anchor)
+        aux_compact = compact_loss.new_zeros(())
+        if self.prediction_space not in {"state", "compact", "z", "emb"}:
+            aux_compact = self.compact_loss_weight * compact_loss
+
+        output["pred_loss"] = pred_loss
+        output["compact_loss"] = compact_loss
+        output["code_loss"] = code_loss
+        output["anchor_loss"] = anchor_loss
+        output["reg_loss"] = anchor_loss
+        output["loss"] = pred_loss + aux_compact + float(beta) * anchor_loss
+        if not torch.isfinite(output["loss"]):
+            raise FloatingPointError("non-finite ConvRSSMGaussianWM loss")
+        output.update(self._diagnostics(z_anchor, code_anchor, pred_code, beta, compact_loss, code_loss))
+        return output
+
+    def rollout(self, info, action_sequence, history_size: int = 3):
+        assert "pixels" in info, "pixels not in info_dict"
+        H = info["pixels"].size(2)
+        B, S, T = action_sequence.shape[:3]
+        act_0, act_future = torch.split(action_sequence, [H, T - H], dim=2)
+        info["action"] = act_0
+        n_steps = T - H
+
+        init = {k: v[:, 0] for k, v in info.items() if torch.is_tensor(v)}
+        init = self.encode(init)
+        emb = init["emb"].unsqueeze(1).expand(B, S, -1, -1)
+        emb = rearrange(emb, "b s ... -> (b s) ...").clone()
+        act = rearrange(act_0, "b s ... -> (b s) ...")
+        act_future = rearrange(act_future, "b s ... -> (b s) ...")
+
+        HS = history_size
+        for t in range(n_steps):
+            act_emb = self.action_encoder(act)
+            pred = self.predict(emb[:, -HS:], act_emb[:, -HS:])[:, -1:]
+            emb = torch.cat([emb, pred], dim=1)
+            act = torch.cat([act, act_future[:, t : t + 1]], dim=1)
+
+        act_emb = self.action_encoder(act)
+        pred = self.predict(emb[:, -HS:], act_emb[:, -HS:])[:, -1:]
+        emb = torch.cat([emb, pred], dim=1)
+        info["predicted_emb"] = rearrange(emb, "(b s) ... -> b s ...", b=B, s=S)
+        return info
+
+    def criterion(self, info_dict):
+        pred_z = info_dict["predicted_emb"][..., -1, :]
+        goal_z = info_dict["goal_emb"][..., -1:, :].expand_as(
+            info_dict["predicted_emb"]
+        )[..., -1, :].detach()
+        compact_cost = (pred_z - goal_z).pow(2).sum(dim=-1)
+        if self.goal_cost in {"compact_mse", "state_mse", "mse"}:
+            return compact_cost
+
+        pred_code = self.decode_state(pred_z)
+        goal_code = info_dict["goal_code_emb"][..., -1, :].detach()
+        code_cost = (pred_code - goal_code).pow(2).mean(dim=-1)
+        if self.goal_cost in {"code_mse", "high_d", "highd"}:
+            return code_cost
+        if self.goal_cost == "hybrid":
+            return compact_cost + self.planner_code_weight * code_cost
+        return compact_cost
+
+    def get_cost(self, info_dict, action_candidates):
+        device = next(self.parameters()).device
+        for k in list(info_dict.keys()):
+            if torch.is_tensor(info_dict[k]):
+                info_dict[k] = info_dict[k].to(device)
+
+        goal = {k: v[:, 0] for k, v in info_dict.items() if torch.is_tensor(v)}
+        goal["pixels"] = goal["goal"]
+        for k in list(goal.keys()):
+            if k.startswith("goal_"):
+                goal[k[len("goal_") :]] = goal.pop(k)
+        goal.pop("action", None)
+        goal = self.encode(goal)
+        info_dict["goal_emb"] = goal["emb"]
+        info_dict["goal_code_emb"] = goal["code_emb"]
+        info_dict = self.rollout(info_dict, action_candidates)
+        return self.criterion(info_dict)
+

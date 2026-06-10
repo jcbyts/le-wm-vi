@@ -1,0 +1,32 @@
+# @package _global_
+forward_type: poiswm
+output_model_name: gaussian_conv_rssm
+normalize_img: false
+
+model:
+  _target_: jepa.ConvRSSMGaussianWM
+  img_size: ${img_size}
+  in_channels: 3
+  code_channels: 64
+  state_dim: 128
+  hidden_channels: [32, 64, 128]
+  sigreg_knots: 17
+  sigreg_num_proj: 1024
+  prediction_space: code
+  anchor_space: prediction
+  goal_cost: compact_mse
+  planner_code_weight: 0.0
+  compact_loss_weight: 0.1
+
+  action_encoder:
+    _target_: module.Embedder
+    input_dim: ???
+    emb_dim: 128
+
+loss:
+  beta: 0.09
+  sigreg:
+    weight: 0.09
+    kwargs:
+      knots: 17
+      num_proj: 1024
